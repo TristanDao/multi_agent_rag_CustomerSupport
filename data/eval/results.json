@@ -1,0 +1,109 @@
+{
+  "intent_routing": {
+    "intent_accuracy": 0.6818181818181818,
+    "total": 44,
+    "correct": 30,
+    "per_intent_accuracy": {
+      "product_search": 1.0,
+      "product_comparison": 0.0,
+      "inventory_check": 1.0,
+      "wholesale_pricing": 0.6666666666666666,
+      "order_tracking": 0.75,
+      "return_refund": 1.0,
+      "shipping_policy": 1.0,
+      "payment_terms": 0.6666666666666666,
+      "warranty_policy": 0.5,
+      "sales_recommendation": 0.5,
+      "human_escalation": 1.0,
+      "general_faq": 0.0
+    },
+    "failures": [
+      {
+        "query": "So sánh hai loại giấy A4 IK Plus và Double A.",
+        "expected": "product_comparison",
+        "predicted": "product_search"
+      },
+      {
+        "query": "Khách mới mua sỉ thì cần đặt cọc bao nhiêu?",
+        "expected": "payment_terms",
+        "predicted": "wholesale_pricing"
+      },
+      {
+        "query": "Máy tính Casio có bảo hành bao lâu?",
+        "expected": "warranty_policy",
+        "predicted": "product_search"
+      },
+      {
+        "query": "Gợi ý thêm sản phẩm cho khách mua máy tính Casio.",
+        "expected": "sales_recommendation",
+        "predicted": "product_search"
+      },
+      {
+        "query": "Bút bi nào viết êm tay nhất?",
+        "expected": "general_faq",
+        "predicted": "product_search"
+      },
+      {
+        "query": "Giấy 70gsm và 80gsm khác nhau thế nào?",
+        "expected": "general_faq",
+        "predicted": "product_search"
+      },
+      {
+        "query": "Một thùng giấy A4 có bao nhiêu ram?",
+        "expected": "general_faq",
+        "predicted": "product_search"
+      },
+      {
+        "query": "Đơn hàng sỉ nào cần manager duyệt?",
+        "expected": "general_faq",
+        "predicted": "wholesale_pricing"
+      },
+      {
+        "query": "Cửa hàng có chính sách giá đặc biệt cho khách corporate không?",
+        "expected": "wholesale_pricing",
+        "predicted": "product_search"
+      },
+      {
+        "query": "Có khuyến mãi gì trong tháng này không?",
+        "expected": "general_faq",
+        "predicted": "product_search"
+      },
+      {
+        "query": "Mã WELCOME10 áp dụng khi nào?",
+        "expected": "general_faq",
+        "predicted": "unknown"
+      },
+      {
+        "query": "Khách hàng C00020 đã mua gì trong 3 tháng qua?",
+        "expected": "order_tracking",
+        "predicted": "unknown"
+      },
+      {
+        "query": "Mực in Canon 037 có tương thích máy in nào?",
+        "expected": "general_faq",
+        "predicted": "product_search"
+      },
+      {
+        "query": "Công ty tôi cần mua bulk giấy A4 mỗi tháng, có chính sách riêng không?",
+        "expected": "wholesale_pricing",
+        "predicted": "product_search"
+      }
+    ]
+  },
+  "guardrail": {
+    "precision": 1.0,
+    "recall": 1.0,
+    "false_positive_rate": 0.0,
+    "tp": 4,
+    "fp": 0,
+    "tn": 47,
+    "fn": 0
+  },
+  "end_to_end": {
+    "samples": 5,
+    "avg_latency_ms": 2.6,
+    "max_latency_ms": 12,
+    "pii_redactions": 0,
+    "blocked_responses": 0
+  }
+}

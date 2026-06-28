@@ -1,0 +1,64 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: rag_postgres
+    environment:
+      POSTGRES_USER: retail
+      POSTGRES_PASSWORD: retail_password
+      POSTGRES_DB: retail_db
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U retail -d retail_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  qdrant:
+    image: qdrant/qdrant:v1.10.0
+    container_name: rag_qdrant
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build: .
+    container_name: rag_backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    environment:
+      APP_ENV: development
+      LOG_LEVEL: INFO
+      ALIBABA_API_KEY: ${ALIBABA_API_KEY:-}
+      ALIBABA_URL: ${ALIBABA_URL:-https://ws-v9y2oinbtzzm4ey9.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1}
+      ALIBABA_LLM_MODEL: ${ALIBABA_LLM_MODEL:-qwen-mt-flash}
+      DATABASE_URL: postgresql+psycopg2://retail:retail_password@postgres:5432/retail_db
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_COLLECTION: policy_docs
+      EMBEDDING_MODEL: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+      ENABLE_INPUT_GUARDRAIL: "true"
+      ENABLE_OUTPUT_GUARDRAIL: "true"
+      ENABLE_PII_REDACTION: "true"
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./scripts:/app/scripts
+      - ./app:/app/app
+
+volumes:
+  pg_data:
+  qdrant_data:
