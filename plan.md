@@ -38,41 +38,62 @@ Use the following stack unless there is a better reason to change it:
 
 ### LLM / Agent Framework
 
-* **OpenAI SDK** (Python `openai` package) for direct model calls, embeddings, and utility operations
-* **LangChain** as the agent-building toolkit, specifically:
+* **Alibaba DashScope** is the **sole LLM provider** (Qwen chat, text-embedding-v3, gte-rerank). It exposes an **OpenAI-compatible** API, so the **OpenAI Python SDK** (`openai` package) is used as the HTTP transport — pointed at the Alibaba endpoint via `base_url`. There is no `OPENAI_API_KEY`; the SDK is reused purely for the wire format.
+* **LangChain** as the agent-building toolkit:
   * `langchain-core` for base abstractions (messages, prompts, runnables)
-  * `langchain-openai` for `ChatOpenAI` / `OpenAIEmbeddings` wrappers (uses OpenAI SDK under the hood)
+  * `langchain-openai` for `ChatOpenAI` (reused as the Alibaba client)
   * `langchain-community` for vector store / retriever / document loader integrations
 * **LangGraph** is the orchestrator — a `StateGraph` that wires specialized LangChain agents as nodes, manages shared state, and supports conditional routing, cycles, and human-in-the-loop
 * **LangGraph checkpointer** (`langgraph-checkpoint-postgres`) for state persistence, audit trail, and resume of mid-conversation flows
 * **How they work together**:
   * LangGraph is the orchestrator (the "brain" and the state machine)
-  * Each node in the graph is either a specialized LangChain agent (`create_openai_tools_agent` + `AgentExecutor`) or a direct LLM/tool call
-  * Use LangChain's `ChatOpenAI` wrapper for all LLM calls inside nodes (it internally calls the OpenAI SDK)
-  * Use raw OpenAI SDK directly only for: embeddings, simple non-agent completions, batch operations, custom utility scripts
+  * Each node in the graph is either a specialized LangChain agent or a direct LLM/tool call
+  * All LLM calls go through `ChatOpenAI(base_url=ALIBABA_URL, api_key=ALIBABA_API_KEY)` or the raw `openai.OpenAI()` client
   * Define node tools with LangChain's `@tool` decorator
   * LangGraph compiles the graph once at startup; the FastAPI app invokes `graph.ainvoke(state, config)` per request
-* Do not mix two different LLM providers without explicit reason. OpenAI is the default.
+* Do not add a second LLM provider. Alibaba is the only one.
 
 ### Vector Database
 
-
-* Qdrant
+* Qdrant (with in-memory fallback for dev/tests)
 
 ### Embedding Model
 
-* Sentence Transformers
+* **Alibaba `text-embedding-v3`** (1024-dim, OpenAI-compatible API) — primary
+* Fallback: `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (offline dev)
+
+### Rerank Model
+
+* **Alibaba `gte-rerank`** (separate API) — re-orders top-N candidates from hybrid retrieval
+* Fallback: score-based ordering (no rerank)
+
+### Hybrid Retrieval
+
+* **Sparse**: BM25 over chunk content (Qdrant sparse vectors or in-memory `rank_bm25` index)
+* **Dense**: cosine similarity over Alibaba `text-embedding-v3` (Qdrant dense vectors)
+* **Merge**: weighted score (configurable `HYBRID_SPARSE_WEIGHT` + `HYBRID_DENSE_WEIGHT`)
+* **Filter**: Qdrant payload filter by `source`, `section`, `intent_tags`
+* **Pipeline**: query → [BM25 top-N, vector top-N] → merge → rerank top-K
 
 ### Observability
 
-* Langfuse for LLM traces
-* Structured JSON logging
+* **Langfuse** (required) for LLM traces — tracks prompts, completions, tool calls, costs, latency, guardrail results
+* Langfuse runs as a Docker service backed by its **own Postgres database** (`langfuse-db` container)
+* **LangGraph ↔ Langfuse** integration via `langfuse.langchain.CallbackHandler` — every node, LLM call, and tool call is auto-traced
+* Structured JSON logging (PII-redacted)
 * Optional: OpenTelemetry later
+
+### Chat UI
+
+* **Streamlit** — simple web chat for manual agent testing
+* Sends messages to `/chat`, shows answer + intent + agents_called + tools_called + sources
+* Maintains session-scoped `thread_id` for multi-turn testing
+* Runs as a Docker service (`streamlit` container), exposed on port `8501`
 
 ### Deployment
 
 * Docker
-* Docker Compose for local development
+* Docker Compose for local development (Postgres + Qdrant + Langfuse + Langfuse-DB + Backend + Streamlit)
 * Terraform as optional cloud deployment phase
 
 ---
@@ -81,46 +102,54 @@ Use the following stack unless there is a better reason to change it:
 
 ```text
 User
- ↓
-FastAPI Backend
- ↓
-Input Guardrail
- - prompt injection detection
- - PII detection/redaction for logs
- ↓
-LangGraph Orchestrator (StateGraph + Postgres Checkpointer)
- ↓
-Nodes (each is a LangChain agent or direct LLM call)
-├── route_intent
-│   └── classifies user intent using Agent Registry metadata
-│
-├── product_agent
-│   └── SQL: products, inventory, price_tiers, promotions
-│
-├── order_agent
-│   └── SQL: customers, orders, order_items
-│
-├── policy_rag_agent
-│   └── Vector DB: markdown/PDF policy documents
-│
-├── sales_recommendation_agent
-│   └── SQL + product/category rules
-│
-├── refund_decision_agent
-│   └── Order data + return/refund policy (sub-graph)
-│
-├── response_agent
-│   └── Compose final user-facing answer
-│
-└── human_escalation
-    └── Handoff to human support (terminal node)
- ↓
-Final Guardrail
- - prevent unsupported claims
- - prevent unsafe financial/business promises
- - ensure policy-grounded response
- ↓
-Response to User
+ │
+ ├──► Streamlit UI (http://localhost:8501) ──► FastAPI Backend
+ │                                              │
+ │                                              ▼
+ │                                       Input Guardrail
+ │                                        - prompt injection detection
+ │                                        - PII detection/redaction for logs
+ │                                              │
+ │                                              ▼
+ │                                       LangGraph Orchestrator (StateGraph + Postgres Checkpointer)
+ │                                              │
+ │                                              ▼
+ │                                       Nodes (each is a LangChain agent or direct LLM call)
+ │                                       ├── route_intent
+ │                                       │   └── classifies user intent using Agent Registry metadata
+ │                                       │
+ │                                       ├── product_agent
+ │                                       │   └── SQL: products, inventory, price_tiers, promotions
+ │                                       │
+ │                                       ├── order_agent
+ │                                       │   └── SQL: customers, orders, order_items
+ │                                       │
+ │                                       ├── policy_rag_agent
+ │                                       │   └── Hybrid Retrieval (BM25 + Dense + Rerank + Metadata Filter)
+ │                                       │       └── Qdrant (dense) + BM25 index (sparse)
+ │                                       │       └── Filter by source / section / intent_tags
+ │                                       │       └── Rerank with Alibaba gte-rerank
+ │                                       │
+ │                                       ├── sales_recommendation_agent
+ │                                       │   └── SQL + product/category rules
+ │                                       │
+ │                                       ├── refund_decision_agent
+ │                                       │   └── Order data + return/refund policy (sub-graph)
+ │                                       │
+ │                                       ├── response_agent
+ │                                       │   └── Compose final user-facing answer
+ │                                       │
+ │                                       └── human_escalation
+ │                                           └── Handoff to human support (terminal node)
+ │                                              │
+ │                                              ▼
+ │                                       Final Guardrail
+ │                                        - prevent unsupported claims
+ │                                        - prevent unsafe financial/business promises
+ │                                        - ensure policy-grounded response
+ │                                              │
+ │                                              ▼
+ │                                       Response to User
  ↓
 State Persistence
  - LangGraph checkpointer (Postgres)
@@ -128,12 +157,12 @@ State Persistence
  - resume mid-conversation
  - audit trail
  ↓
-Observability
- - Langfuse trace (per node)
- - structured logs
- - latency, token usage, tool calls
- - guardrail result
- - PII-redacted logs only
+Observability (Langfuse, required)
+ - Langfuse service (Docker) backed by langfuse-db (Postgres)
+ - Traces per node, per LLM call, per tool call
+ - Token usage, cost, latency, guardrail result, retrieved doc ids
+ - LangGraph CallbackHandler auto-traces everything
+ - Structured JSON logs (PII-redacted)
  - Agent Registry exposed at /admin/agents
  - Graph diagram exposed at /admin/graph
 ```
@@ -146,19 +175,32 @@ Observability
 
 ### Goal
 
-Create a clean backend project structure with local development support.
+Create a clean backend project structure with local development support, including **Langfuse** (LLM observability, backed by its own Postgres) and a **Streamlit** chat UI for manual testing.
 
 ### Tasks
 
 1. Initialize Python project.
 2. Create FastAPI app.
-3. Add environment configuration.
+3. Add environment configuration (Alibaba-only LLM, embedding, rerank, Langfuse).
 4. Add Dockerfile.
-5. Add Docker Compose.
-6. Add database service.
-7. Add vector database service.
-8. Add `.env.example`.
-9. Add basic health-check endpoint.
+5. Add Docker Compose with all services (see below).
+6. Add application database service (`postgres`).
+7. Add vector database service (`qdrant`).
+8. Add **Langfuse service + its own database** (`langfuse`, `langfuse-db`).
+9. Add **Streamlit UI service** (`streamlit`).
+10. Add `.env.example`.
+11. Add basic health-check endpoint.
+
+### Required services in `docker-compose.yml`
+
+```text
+postgres        # app data + LangGraph checkpointer (database: retail_db)
+qdrant          # vector store for RAG
+langfuse-db     # Postgres for Langfuse (database: langfuse)
+langfuse        # Langfuse v3 (port 3000) — LLM observability UI + API
+backend         # FastAPI (port 8000)
+streamlit       # Streamlit chat UI (port 8501)
+```
 
 ### Suggested project structure
 
@@ -175,7 +217,8 @@ multi_agent_rag_retail/
 │   │   ├── logging.py
 │   │   ├── security.py
 │   │   ├── pii_redaction.py
-│   │   └── observability.py
+│   │   ├── observability.py         # Langfuse integration + LangGraph callbacks
+│   │   └── llm.py                   # OpenAI SDK client pointed at Alibaba
 │   ├── db/
 │   │   ├── session.py
 │   │   ├── models.py
@@ -183,16 +226,18 @@ multi_agent_rag_retail/
 │   │   └── seed.py
 │   ├── rag/
 │   │   ├── document_loader.py
-│   │   ├── chunking.py
-│   │   ├── embeddings.py
-│   │   ├── vector_store.py
-│   │   └── retriever.py
+│   │   ├── chunking.py              # markdown chunking with metadata
+│   │   ├── embeddings.py            # Alibaba text-embedding-v3 (with sentence-transformers fallback)
+│   │   ├── bm25_index.py            # in-memory BM25 over chunks
+│   │   ├── rerank.py                # Alibaba gte-rerank client (with no-op fallback)
+│   │   ├── vector_store.py          # Qdrant with in-memory fallback
+│   │   └── retriever.py             # hybrid: BM25 + dense + filter + rerank
 │   ├── agents/
-│   │   ├── registry.py             # AgentSpec + AGENT_REGISTRY (single source of truth)
-│   │   ├── state.py                # SupportState TypedDict
-│   │   ├── graph.py                # build_orchestrator_graph()
-│   │   ├── checkpointer.py         # Postgres checkpointer factory
-│   │   ├── orchestrator.py         # route_intent node + routing logic
+│   │   ├── registry.py
+│   │   ├── state.py
+│   │   ├── graph.py
+│   │   ├── checkpointer.py
+│   │   ├── orchestrator.py
 │   │   ├── nodes/
 │   │   │   ├── __init__.py
 │   │   │   ├── route_intent.py
@@ -209,7 +254,7 @@ multi_agent_rag_retail/
 │   │   │   ├── product_tools.py
 │   │   │   ├── order_tools.py
 │   │   │   └── pricing_tools.py
-│   │   └── prompts/                # versioned prompts (.py or .yaml)
+│   │   └── prompts/
 │   ├── guardrails/
 │   │   ├── input_guardrail.py
 │   │   ├── prompt_injection.py
@@ -220,45 +265,31 @@ multi_agent_rag_retail/
 │       ├── evaluator.py
 │       └── metrics.py
 │
+├── ui/
+│   ├── Dockerfile
+│   ├── app.py                       # Streamlit chat UI
+│   └── requirements.txt
+│
 ├── data/
 │   ├── structured/
-│   │   ├── products.csv
-│   │   ├── customers.csv
-│   │   ├── orders.csv
-│   │   ├── order_items.csv
-│   │   ├── inventory.csv
-│   │   ├── price_tiers.csv
-│   │   └── promotions.csv
 │   └── docs/
-│       ├── wholesale_policy.md
-│       ├── return_refund_policy.md
-│       ├── shipping_policy.md
-│       ├── warranty_policy.md
-│       ├── payment_terms.md
-│       ├── product_faq.md
-│       └── escalation_policy.md
 │
 ├── scripts/
 │   ├── generate_synthetic_data.py
-│   ├── ingest_docs.py
+│   ├── ingest_docs.py               # writes dense vectors + BM25 index + payload metadata
 │   ├── seed_database.py
-│   ├── generate_agent_graph.py     # auto-generate Mermaid diagram from registry + compiled graph
+│   ├── generate_agent_graph.py
 │   └── run_eval.py
 │
 ├── docs/
-│   ├── agent_graph.md             # auto-generated Mermaid block
-│   └── agent_graph.svg            # auto-generated PNG/SVG render
+│   ├── agent_graph.md
+│   └── agent_graph.svg
 │
 ├── infra/
 │   ├── docker-compose.yml
 │   └── terraform/
 │
 ├── tests/
-│   ├── test_product_agent.py
-│   ├── test_order_agent.py
-│   ├── test_policy_rag_agent.py
-│   ├── test_guardrails.py
-│   └── test_api_chat.py
 │
 ├── Dockerfile
 ├── docker-compose.yml
@@ -269,8 +300,10 @@ multi_agent_rag_retail/
 
 ### Acceptance Criteria
 
-* `docker compose up` starts the backend, database, and vector DB.
+* `docker compose up` starts all 6 services (postgres, qdrant, langfuse-db, langfuse, backend, streamlit).
 * `GET /health` returns status OK.
+* `http://localhost:3000` shows the Langfuse UI (default credentials from `.env`).
+* `http://localhost:8501` shows the Streamlit chat UI.
 * Environment variables are loaded from `.env`.
 
 ---
@@ -553,58 +586,128 @@ Should include:
 
 ---
 
-## Phase 4: RAG Pipeline
+## Phase 4: RAG Pipeline (hybrid + metadata filter + rerank)
 
 ### Goal
 
-Implement document ingestion and retrieval.
+Implement document ingestion and **hybrid retrieval** (sparse BM25 + dense embeddings) with **metadata filtering** and **reranking**. The retriever is the single source of truth for the policy / FAQ / wholesale evidence that goes into every grounded answer.
 
 ### Tasks
 
 1. Load markdown files from `data/docs`.
-2. Chunk documents.
-3. Generate embeddings.
-4. Store chunks in vector DB.
-5. Implement retriever.
-6. Return retrieved chunks with metadata:
+2. Chunk documents (preserve section + source metadata).
+3. Generate dense embeddings via Alibaba `text-embedding-v3` (1024-dim, OpenAI-compatible API).
+4. Build a **BM25 index** over chunk content (in-memory via `rank_bm25`, or Qdrant sparse vectors).
+5. Store chunks in Qdrant with a rich **payload schema** (see below).
+6. Implement the **hybrid retriever** (`app/rag/retriever.py`):
+   a. Optional metadata filter (by `source`, `section`, `intent_tags`)
+   b. Run BM25 top-N and vector top-N in parallel
+   c. Weighted merge (configurable `HYBRID_SPARSE_WEIGHT` + `HYBRID_DENSE_WEIGHT`)
+   d. Rerank merged candidates with Alibaba `gte-rerank` (configurable `RERANK_TOP_N`)
+   e. Return final top-K with both `vector_score` and `rerank_score`
+7. Wire the retriever into the `policy_rag_agent` and the wholesale policy fetch in `product_agent`.
 
-   * source file
-   * section title
-   * chunk id
-   * score
+### Embedding
+
+* Primary: **Alibaba `text-embedding-v3`** via OpenAI-compatible `/v1/embeddings` endpoint.
+  * Set `EMBEDDING_PROVIDER=alibaba`, `EMBEDDING_MODEL=text-embedding-v3`, `EMBEDDING_DIM=1024`.
+* Fallback: `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (384-dim) for offline dev.
+* `app/rag/embeddings.py` reads the provider/model/dim from settings.
+
+### Rerank
+
+* Primary: **Alibaba `gte-rerank`** via its dedicated REST endpoint (not OpenAI-compatible).
+  * Set `RERANK_PROVIDER=alibaba`, `RERANK_MODEL=gte-rerank`, `RERANK_TOP_N=20`.
+* Fallback: skip rerank, return merged candidates sorted by hybrid score.
+* `app/rag/rerank.py` exposes a single `rerank(query, candidates, top_k)` function.
 
 ### Chunking strategy
 
-Use simple chunking first:
+Markdown-aware section splitter, then word-based chunking:
 
 ```text
 chunk_size: 500 - 800 tokens
 chunk_overlap: 80 - 150 tokens
+preserve: section heading as metadata
 ```
 
-### Retrieval requirements
+### Qdrant payload schema
 
-Retriever should return:
+Each point carries:
 
 ```json
 {
-  "query": "...",
+  "doc_id": "return_refund_policy.md#return-window#3",
+  "source": "return_refund_policy.md",
+  "section": "Return Window",
+  "chunk_index": 3,
+  "intent_tags": ["return_refund", "general_faq"],
+  "content": "Đơn hàng được đổi trả trong vòng 7 ngày..."
+}
+```
+
+`intent_tags` is filled automatically at ingest time by matching the source file name against the registry's intent map. This enables metadata filter: `intent=shipping_policy` → only chunks whose `intent_tags` includes `shipping_policy`.
+
+### Hybrid retrieval (default)
+
+```text
+1. metadata filter (optional)         — e.g. intent_tags in ["shipping_policy", "general_faq"]
+2. BM25 top-N (sparse)                — e.g. N=20
+3. Vector top-N (dense)               — same N
+4. Merge by doc_id, weighted score    — score = HYBRID_SPARSE_WEIGHT*sparse + HYBRID_DENSE_WEIGHT*dense
+5. Rerank top-K                       — default K=5
+6. Return chunks with both scores
+```
+
+### Retrieval response
+
+```json
+{
+  "query": "phí ship nội thành HCM",
+  "filter": {"intent_tags": ["shipping_policy"]},
   "chunks": [
     {
+      "doc_id": "shipping_policy.md#city-delivery#1",
       "content": "...",
-      "source": "return_refund_policy.md",
-      "section": "Return Window",
-      "score": 0.87
+      "source": "shipping_policy.md",
+      "section": "Phí vận chuyển nội thành",
+      "intent_tags": ["shipping_policy"],
+      "vector_score": 0.81,
+      "sparse_score": 4.2,
+      "hybrid_score": 0.74,
+      "rerank_score": 0.92
     }
   ]
 }
 ```
 
+### Env vars (added to .env.example)
+
+```text
+EMBEDDING_PROVIDER=alibaba
+EMBEDDING_MODEL=text-embedding-v3
+EMBEDDING_DIM=1024
+
+RERANK_PROVIDER=alibaba
+RERANK_MODEL=gte-rerank
+RERANK_TOP_N=20
+
+HYBRID_SPARSE_WEIGHT=0.4
+HYBRID_DENSE_WEIGHT=0.6
+HYBRID_TOP_N=20
+RERANK_FINAL_K=5
+```
+
 ### Acceptance Criteria
 
-* `scripts/ingest_docs.py` ingests all policy docs.
-* Policy RAG Agent can answer questions with retrieved evidence.
-* Final answers mention source policy when relevant.
+* `scripts/ingest_docs.py` ingests all policy docs and populates Qdrant + the BM25 index.
+* Retriever returns top-K with both `vector_score` and `rerank_score`.
+* Metadata filter by `intent` and `source` correctly narrows results.
+* Hybrid search outperforms pure dense on the eval set (measured by retrieval relevance metric in Phase 11).
+* The retriever works in both modes:
+  * Alibaba live (real `text-embedding-v3` + `gte-rerank`)
+  * Offline fallback (sentence-transformers + no rerank) for dev without API keys
+* Policy RAG Agent and the product_agent's wholesale policy fetch both go through this retriever.
 
 ---
 
@@ -1202,33 +1305,92 @@ unredacted phone/email
 
 ---
 
-## Phase 9: Observability
+## Phase 9: Observability (Langfuse, required)
 
 ### Goal
 
-Add LLM and application observability.
+Full LLM and application observability via **Langfuse**, which runs as a Docker service backed by its own **Postgres database** (`langfuse-db`).
 
-### Minimum implementation
+### Langfuse services in `docker-compose.yml`
 
-Use Langfuse to track:
+```yaml
+langfuse-db:
+  image: postgres:16-alpine
+  container_name: langfuse_db
+  environment:
+    POSTGRES_USER: langfuse
+    POSTGRES_PASSWORD: langfuse_password
+    POSTGRES_DB: langfuse
+  volumes:
+    - langfuse_pg:/var/lib/postgresql/data
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U langfuse -d langfuse"]
+    interval: 5s
+    timeout: 5s
+    retries: 10
 
-```text
-user request
-selected intent
-agents called
-tools called
-retrieved documents
-LLM model
-latency
-token usage
-cost if available
-guardrail result
-final response status
+langfuse:
+  image: langfuse/langfuse:3
+  container_name: langfuse
+  depends_on:
+    langfuse-db:
+      condition: service_healthy
+  environment:
+    DATABASE_URL: postgresql://langfuse:langfuse_password@langfuse-db:5432/langfuse
+    NEXTAUTH_URL: http://localhost:3000
+    NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET:-please-change-me}
+    LANGFUSE_INIT_USER_EMAIL: ${LANGFUSE_USER_EMAIL:-admin@example.com}
+    LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_USER_PASSWORD:-admin_password}
+  ports:
+    - "3000:3000"
+
+volumes:
+  langfuse_pg:
 ```
 
-### Optional metrics
+### What we trace
 
-Add Prometheus/Grafana later for:
+* **One trace per `/chat` request** — `request_id` is the Langfuse trace id, `thread_id` is the conversation id, `user_id` is `customer_id` when present.
+* **Spans per node** — `route_intent`, `product_agent`, `response_agent`, ...
+* **Generations per LLM call** — system + user prompts, model output, model name, temperature, prompt/completion tokens, **estimated cost** (USD), latency.
+* **Spans per tool call** — tool name, input args, output, latency.
+* **Spans for retrieval** — query, filter, BM25 top-N, vector top-N, rerank scores.
+* **Scores** — guardrail result (input/output passed/blocked), retrieval relevance (from eval), groundedness.
+* **Errors** — captured with stack trace, linked to the trace.
+
+### LangGraph ↔ Langfuse integration
+
+* Use `langfuse.langchain.CallbackHandler` from `app/core/observability.py`:
+  ```python
+  from langfuse.langchain import CallbackHandler
+  handler = CallbackHandler(trace_context={"trace_id": request_id})
+  result = await graph.ainvoke(state, config={"callbacks": [handler], "configurable": {"thread_id": thread_id}})
+  ```
+* Every node's LLM calls and tool calls are auto-traced; no per-node instrumentation needed.
+* Pass the same `CallbackHandler` to `langchain_openai.ChatOpenAI(...)` and to `AgentExecutor(..., callbacks=[handler])` for full coverage.
+
+### Env vars (Langfuse is required, not optional)
+
+```text
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_SECRET_KEY=sk-lf-...
+LANGFUSE_HOST=http://langfuse:3000
+LANGFUSE_ENABLED=true
+LANGFUSE_NEXTAUTH_SECRET=change-me-in-prod
+LANGFUSE_USER_EMAIL=admin@example.com
+LANGFUSE_USER_PASSWORD=change-me-in-prod
+```
+
+`app/core/observability.py` initialises the Langfuse client at startup. If `LANGFUSE_ENABLED=true` but the client cannot connect, app startup fails fast (this is intentional — silent observability outages hide production issues).
+
+### Structured JSON logging (unchanged)
+
+* Every log line includes `request_id`, `thread_id`, `intent`, `agents_called`, `tools_called`, `latency_ms`, `token_usage`, `guardrail_result`, `pii_redacted`.
+* PII (phone, email, address, card-like numbers, API keys) is redacted before write.
+
+### Optional metrics (deferred)
+
+Prometheus / Grafana for:
 
 ```text
 request count
@@ -1242,10 +1404,14 @@ database latency
 
 ### Acceptance Criteria
 
-* Each chat request creates one trace.
-* Each agent/tool call is visible in the trace.
-* Token usage and latency are recorded.
-* Errors are traceable by request_id.
+* `docker compose up` brings Langfuse up at `http://localhost:3000`; default admin user works.
+* Each chat request creates one trace in Langfuse with the matching `request_id`.
+* Token usage and estimated cost are visible per generation.
+* Tool calls appear as spans inside the parent node span.
+* Retrieval runs (`BM25`, `vector`, `rerank`) appear as nested spans under the `policy_rag_agent` span.
+* Guardrail block events appear as scores on the trace.
+* Errors are traceable by `request_id` and `trace_id`.
+* Stopping the Langfuse container with `LANGFUSE_ENABLED=true` makes the backend fail to start (or fail loudly per request) — observability outages are not silent.
 
 ---
 
@@ -1417,34 +1583,48 @@ token usage
 
 ### Goal
 
-Make the project easy to run locally.
+Make the project easy to run locally with a single `docker compose up`.
 
-### Required services in Docker Compose
+### Required services in `docker-compose.yml`
 
 ```text
-backend
-postgres or sqlserver
-qdrant or chromadb
-optional: langfuse
+backend         # FastAPI on :8000
+postgres        # app data + LangGraph checkpointer (db: retail_db) on :5432
+qdrant          # vector store on :6333
+langfuse-db     # Postgres for Langfuse (db: langfuse)
+langfuse        # Langfuse v3 observability UI/API on :3000
+streamlit       # Streamlit chat UI on :8501
 ```
 
-### Commands
-
-Add these commands to README:
+### Commands (add to README)
 
 ```bash
-docker compose up --build
-python scripts/generate_synthetic_data.py
-python scripts/seed_database.py
-python scripts/ingest_docs.py
-python scripts/run_eval.py
+docker compose up --build -d
+docker compose exec backend python scripts/seed_database.py
+docker compose exec backend python scripts/ingest_docs.py
+
+# Open in browser:
+#   http://localhost:8000  — FastAPI + Swagger UI
+#   http://localhost:3000  — Langfuse UI (admin@example.com / admin_password)
+#   http://localhost:8501  — Streamlit chat UI
+```
+
+### Service dependency order
+
+```text
+postgres (healthy) ──┬──► backend ──► streamlit
+                     │
+qdrant   (healthy) ──┘
+                     │
+langfuse-db (healthy)──► langfuse (healthy) ──► backend (waits for langfuse to be reachable)
 ```
 
 ### Acceptance Criteria
 
-* New developer can run the project from README.
-* Database and vector DB start locally.
-* Data seed and document ingestion work.
+* A new developer can run the entire stack from the README.
+* All 6 services come up healthy; FastAPI and Streamlit are reachable; Langfuse UI loads.
+* Data seed and document ingestion work end-to-end inside the backend container.
+* A `/chat` call appears as a trace in the Langfuse UI within a few seconds.
 
 ---
 
@@ -1509,10 +1689,12 @@ Architecture diagram
 Agent workflow (with auto-generated Mermaid diagram from Agent Registry)
 Registered agents table (auto-generated from registry)
 Data schema
-RAG document structure
-Setup instructions
+RAG pipeline (hybrid + metadata filter + rerank) — how chunks are ingested and retrieved
+Streamlit UI screenshot + how to test
+Langfuse UI screenshot + how to read traces
+Setup instructions (docker compose up brings up everything)
 Environment variables
-API examples (including /admin/agents and /admin/graph)
+API examples (including /admin/agents, /admin/graph, /admin/threads/{id}/history)
 Evaluation results
 Known limitations
 Future improvements
@@ -1584,18 +1766,126 @@ The final project should include:
 1. FastAPI backend
 2. Synthetic retail/wholesale database
 3. Policy/FAQ markdown documents
-4. RAG ingestion pipeline
+4. RAG ingestion pipeline (hybrid + metadata filter + rerank)
 5. Vector DB retrieval
 6. SQL tools
-7. Multi-agent workflow
+7. Multi-agent workflow (LangGraph + Agent Registry)
 8. Prompt injection guardrail
 9. PII-safe structured logging
-10. Langfuse observability
+10. Langfuse observability (required, Postgres-backed)
 11. Evaluation script and test set
-12. Docker Compose setup
-13. README with architecture and examples
-14. Optional Terraform deployment
+12. Docker Compose setup (Postgres + Qdrant + Langfuse + Backend + Streamlit)
+13. Streamlit chat UI
+14. README with architecture and examples
+15. Optional Terraform deployment
 ```
+
+---
+
+## Phase 16: Streamlit Chat UI
+
+### Goal
+
+A simple web UI to test the agents manually without using curl or writing test scripts.
+
+### Stack
+
+* **Streamlit** running in its own Docker container
+* Talks to the FastAPI backend over HTTP (`BACKEND_URL=http://backend:8000`)
+* Maintains a session-scoped `thread_id` for multi-turn testing
+
+### Features
+
+* Chat input box + scrollable message history (user / assistant bubbles)
+* Each assistant message is rendered with:
+  * The answer text
+  * Expandable "Details" section: intent, agents_called, tools_called, thread_id, checkpoint_id, latency_ms, token_usage
+  * Sources list (SQL products + policy docs with section + score)
+* "New conversation" button → resets `thread_id`
+* Sidebar: shows current `thread_id`, link to Langfuse UI (`http://localhost:3000`) and FastAPI Swagger (`http://localhost:8000/docs`)
+* Health indicator: green if `/health` returns OK, red otherwise
+* Toggle to show/hide the raw JSON response
+
+### File: `ui/app.py`
+
+```python
+import os, uuid, requests, streamlit as st
+
+BACKEND = os.environ.get("BACKEND_URL", "http://localhost:8000")
+st.set_page_config(page_title="Agent Test Console", layout="wide")
+
+# session state init
+st.session_state.setdefault("thread_id", f"thread-{uuid.uuid4().hex}")
+st.session_state.setdefault("messages", [])
+
+# sidebar
+with st.sidebar:
+    st.title("Agent Test Console")
+    st.text_input("thread_id", key="thread_id_display", value=st.session_state["thread_id"], disabled=True)
+    if st.button("New conversation"):
+        st.session_state["thread_id"] = f"thread-{uuid.uuid4().hex}"
+        st.session_state["messages"] = []
+        st.rerun()
+    st.markdown(f"[Langfuse UI](http://localhost:3000)  •  [FastAPI docs](http://localhost:8000/docs)")
+
+# chat
+for m in st.session_state["messages"]:
+    with st.chat_message(m["role"]):
+        st.markdown(m["content"])
+        if m.get("meta"):
+            with st.expander("Details"):
+                st.json(m["meta"])
+
+prompt = st.chat_input("Ask the agent...")
+if prompt:
+    r = requests.post(f"{BACKEND}/chat", json={"message": prompt, "thread_id": st.session_state["thread_id"]}, timeout=60)
+    body = r.json()
+    st.session_state["messages"].append({"role": "user", "content": prompt})
+    st.session_state["messages"].append({"role": "assistant", "content": body.get("answer", ""), "meta": body})
+    st.rerun()
+```
+
+### File: `ui/Dockerfile`
+
+```dockerfile
+FROM python:3.11-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY app.py .
+EXPOSE 8501
+CMD ["streamlit", "run", "app.py", "--server.address=0.0.0.0", "--server.port=8501"]
+```
+
+### File: `ui/requirements.txt`
+
+```text
+streamlit==1.39.0
+requests==2.32.3
+```
+
+### docker-compose service
+
+```yaml
+streamlit:
+  build: ./ui
+  container_name: rag_streamlit
+  environment:
+    BACKEND_URL: http://backend:8000
+  depends_on:
+    backend:
+      condition: service_healthy
+  ports:
+    - "8501:8501"
+```
+
+### Acceptance Criteria
+
+* `docker compose up` starts Streamlit at `http://localhost:8501` within ~10s after backend is healthy.
+* Sending a message shows the answer and the expandable "Details" (intent, agents_called, tools_called, sources, thread_id).
+* "New conversation" button resets `thread_id` and clears the history.
+* The same `thread_id` resumes the conversation — second turn uses prior context.
+* If the backend is down, the UI shows a clear error message (not a stack trace).
 
 ---
 
@@ -1613,11 +1903,11 @@ P0:
 
 P1:
 - Policy markdown docs
-- RAG ingestion
+- RAG ingestion (dense only first)
 - Policy RAG Agent
 - Product Agent
 - Order Agent
-- Orchestrator Agent
+- LangGraph orchestrator (basic)
 
 P2:
 - Refund Decision Agent
@@ -1629,9 +1919,16 @@ P3:
 - Prompt injection guardrail
 - PII redaction
 - Structured logging
-- Langfuse traces
+- Agent Registry + diagram generation script
+- Admin endpoints (/admin/agents, /admin/graph, /admin/threads/...)
 
 P4:
+- LangGraph Postgres checkpointer + state persistence
+- Langfuse service in Docker + LangGraph ↔ Langfuse callbacks
+- RAG upgrade: hybrid (BM25) + metadata filter + rerank
+- Streamlit chat UI
+
+P5:
 - Evaluation script
 - Docker Compose polish
 - README
@@ -1656,7 +1953,7 @@ P4:
 8. Always include request_id in logs and responses.
 9. If policy or data is missing, say that information is not available instead of hallucinating.
 10. If the case is uncertain or high-value, escalate to human support.
-11. LLM access is centralized: all agent LLM calls go through `ChatOpenAI` (LangChain). Raw `openai.OpenAI()` is only used in scripts (ingest, eval, seeding) and embeddings. Do not instantiate ad-hoc LLM clients inside agents.
+11. **Alibaba is the only LLM provider**. There is no `OPENAI_API_KEY` anywhere. The OpenAI Python SDK is used purely as the HTTP transport for the Alibaba OpenAI-compatible endpoint (`base_url=ALIBABA_URL`). All embeddings and rerank calls also go through Alibaba (`text-embedding-v3`, `gte-rerank`).
 12. Pin LangChain, LangGraph, and OpenAI SDK versions in `requirements.txt` to avoid breaking changes across `langchain-*` / `langgraph-*` releases.
 13. **Agent Registry is mandatory**: every specialized agent must be declared in `app/agents/registry.py` with a complete `AgentSpec`. The orchestrator builds its routing prompt and the graph nodes from this registry. Adding a new agent without registering it is a bug.
 14. **Intents are globally unique**: an `intent` string maps to exactly one agent key. If two agents claim the same intent, the app must fail at startup.
@@ -1664,6 +1961,9 @@ P4:
 16. **Checkpoints must never contain raw PII**. PII redaction runs before state is written; add a unit test that asserts phone/email patterns are absent from any `checkpoint` JSONB row.
 17. **`thread_id` is required** for every `/chat` call. Generate a UUIDv4 server-side if the client does not provide one, and always echo it back in the response.
 18. **Diagram is generated, not hand-edited**. Do not paste a Mermaid block into README manually; run `scripts/generate_agent_graph.py` instead.
+19. **RAG retrieval is hybrid by default** (BM25 sparse + Alibaba `text-embedding-v3` dense, weighted merge, then rerank with Alibaba `gte-rerank`). Metadata filter by `intent_tags`, `source`, `section` is applied before retrieval. The offline fallback (sentence-transformers + no rerank) is for dev only.
+20. **Langfuse is required** when `LANGFUSE_ENABLED=true`. The app fails loudly at startup if Langfuse is unreachable; observability outages are never silent. The `langfuse.langchain.CallbackHandler` is passed into `graph.ainvoke(...)` so every node, LLM call, and tool call is auto-traced. Costs come from Langfuse's built-in model pricing.
+21. **Streamlit UI is the manual test entry point** — it always talks to the FastAPI backend over HTTP, never to the graph directly. This keeps a single source of truth for the API and makes load testing easy.
 
 ---
 

@@ -2,7 +2,7 @@
 import logging
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from app.config import settings
 
@@ -17,6 +17,7 @@ class VectorRecord:
     section: str
     chunk_index: int
     embedding: List[float] = field(default_factory=list)
+    intent_tags: List[str] = field(default_factory=list)
 
 
 class InMemoryVectorStore:
@@ -31,11 +32,23 @@ class InMemoryVectorStore:
             else:
                 self.records.append(r)
 
-    def search(self, query_vector: List[float], top_k: int = 4) -> List[Tuple[VectorRecord, float]]:
+    def search(
+        self,
+        query_vector: List[float],
+        top_k: int = 4,
+        intent_filter: Optional[Iterable[str]] = None,
+        source_filter: Optional[Iterable[str]] = None,
+    ) -> List[Tuple[VectorRecord, float]]:
         if not self.records:
             return []
+        intent_set = set(intent_filter) if intent_filter else None
+        source_set = set(source_filter) if source_filter else None
         scored: List[Tuple[VectorRecord, float]] = []
         for r in self.records:
+            if intent_set is not None and not (intent_set & set(r.intent_tags or [])):
+                continue
+            if source_set is not None and r.source not in source_set:
+                continue
             if not r.embedding:
                 continue
             score = _cosine(query_vector, r.embedding)
@@ -100,17 +113,59 @@ class QdrantVectorStore:
                     "source": r.source,
                     "section": r.section,
                     "chunk_index": r.chunk_index,
+                    "intent_tags": list(r.intent_tags or []),
                 },
             )
             for r in records
         ]
         self.client.upsert(collection_name=self.collection, points=points)
 
-    def search(self, query_vector: List[float], top_k: int = 4) -> List[Tuple[VectorRecord, float]]:
+    def _build_filter(
+        self,
+        intent_filter: Optional[Iterable[str]] = None,
+        source_filter: Optional[Iterable[str]] = None,
+    ):
+        """Build a Qdrant Filter from the simple intent/source filters.
+
+        `intent_filter` matches if ANY of the listed intents is in `intent_tags`
+        (OR semantics). `source_filter` matches if `source` is one of the
+        listed values (OR).
+        """
+        m = self._models
+        must: List[Any] = []
+        if intent_filter:
+            intents = list(intent_filter)
+            must.append(
+                m.FieldCondition(
+                    key="intent_tags",
+                    match=m.MatchAny(any=intents),
+                )
+            )
+        if source_filter:
+            sources = list(source_filter)
+            must.append(
+                m.FieldCondition(
+                    key="source",
+                    match=m.MatchAny(any=sources),
+                )
+            )
+        if not must:
+            return None
+        return m.Filter(must=must)
+
+    def search(
+        self,
+        query_vector: List[float],
+        top_k: int = 4,
+        intent_filter: Optional[Iterable[str]] = None,
+        source_filter: Optional[Iterable[str]] = None,
+    ) -> List[Tuple[VectorRecord, float]]:
+        flt = self._build_filter(intent_filter=intent_filter, source_filter=source_filter)
         try:
             hits = self.client.search(
                 collection_name=self.collection,
                 query_vector=query_vector,
+                query_filter=flt,
                 limit=top_k,
                 with_payload=True,
             )
@@ -126,6 +181,7 @@ class QdrantVectorStore:
                 source=payload.get("source", ""),
                 section=payload.get("section", ""),
                 chunk_index=int(payload.get("chunk_index", 0)),
+                intent_tags=list(payload.get("intent_tags") or []),
             )
             results.append((rec, float(h.score or 0.0)))
         return results
@@ -166,3 +222,9 @@ def get_vector_store() -> Any:
         logger.warning("qdrant_unavailable err=%s; using in-memory store", str(e))
         _store = InMemoryVectorStore()
     return _store
+
+
+def reset_vector_store() -> None:
+    """Drop the cached store. Used in tests."""
+    global _store
+    _store = None

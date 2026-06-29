@@ -12,6 +12,7 @@ from app.api.routes_chat import router as chat_router
 from app.api.routes_health import router as health_router
 from app.config import settings
 from app.core.logging import setup_logging
+from app.core.observability import get_langfuse_client
 from app.core.security import new_request_id
 from app.db.seed import init_db
 from app.rag.vector_store import get_vector_store
@@ -23,6 +24,17 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("startup app=%s env=%s", settings.APP_NAME, settings.APP_ENV)
+    # Init Langfuse first so an unreachable Langfuse fails the boot loudly
+    # when LANGFUSE_ENABLED=true. Silent observability outages are not OK.
+    try:
+        client = get_langfuse_client()
+        if client is not None:
+            logger.info("langfuse_ready host=%s", settings.LANGFUSE_HOST)
+        else:
+            logger.info("langfuse_disabled (LANGFUSE_ENABLED=false)")
+    except Exception as e:
+        logger.exception("langfuse_init_failed err=%s", str(e))
+        raise
     try:
         init_db()
     except Exception as e:
@@ -36,7 +48,6 @@ async def lifespan(app: FastAPI):
     # StateGraph, wires the checkpointer). Failures here are fatal at startup.
     try:
         graph = get_orchestrator_graph()
-        # Inspect the graph object so the warmup is visible in the logs.
         try:
             node_count = len(graph.get_graph().nodes)
         except Exception:
@@ -51,7 +62,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Multi-Agent RAG Retail Assistant",
-    version="0.2.0",
+    version="0.3.0",
     lifespan=lifespan,
 )
 
@@ -89,3 +100,4 @@ async def add_request_context(request: Request, call_next):
 app.include_router(health_router, tags=["health"])
 app.include_router(chat_router, tags=["chat"])
 app.include_router(admin_router, tags=["admin"])
+

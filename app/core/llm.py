@@ -1,18 +1,15 @@
 """LLM client wrapper.
 
-This module is the single source of LLM access. It uses the official OpenAI Python
-SDK (`from openai import OpenAI`). The same SDK is used for two providers:
+Alibaba DashScope is the sole LLM provider. It exposes an OpenAI-compatible API,
+so the official **OpenAI Python SDK** is used as the HTTP transport — pointed at
+the Alibaba endpoint via `base_url`. There is no `OPENAI_API_KEY`; the SDK is
+reused purely for the wire format.
 
-* OpenAI (default) — when `OPENAI_API_KEY` is set
-* Alibaba DashScope (OpenAI-compatible) — when only `ALIBABA_API_KEY` is set, the
-  OpenAI client is pointed at the Alibaba endpoint via `base_url`
+LangChain agents consume the same provider through `langchain_openai.ChatOpenAI`,
+which also uses the OpenAI SDK under the hood.
 
-The LangChain agents consume the same provider through `langchain_openai.ChatOpenAI`,
-which internally uses the OpenAI SDK. The raw `openai.OpenAI` client exposed here is
-intended for non-agent code (ingestion scripts, evaluators, custom utilities).
-
-If neither key is configured, all calls raise `LLMUnavailable` and callers should fall
-back to deterministic behaviour.
+If no Alibaba key is configured, all calls raise `LLMUnavailable` and callers
+should fall back to deterministic behaviour.
 """
 import json
 import logging
@@ -37,9 +34,8 @@ _client: Optional[OpenAI] = None
 def _build_client() -> OpenAI:
     api_key = settings.llm_api_key()
     if not api_key:
-        raise LLMUnavailable("No LLM API key configured (set OPENAI_API_KEY or ALIBABA_API_KEY)")
-    base_url = settings.llm_base_url() or None
-    return OpenAI(api_key=api_key, base_url=base_url)
+        raise LLMUnavailable("ALIBABA_API_KEY is not set")
+    return OpenAI(api_key=api_key, base_url=settings.llm_base_url())
 
 
 def get_client() -> OpenAI:
@@ -66,11 +62,6 @@ def _default_model() -> str:
     return settings.llm_model()
 
 
-def _to_messages(messages: List[Dict[str, str]]):
-    """Pass-through: OpenAI SDK accepts the same {role, content} dicts we already use."""
-    return messages
-
-
 def chat(
     messages: List[Dict[str, str]],
     model: Optional[str] = None,
@@ -79,16 +70,18 @@ def chat(
     response_format_json: bool = False,
     timeout: float = 30.0,
 ) -> Dict[str, Any]:
-    """Call the chat completions endpoint via the OpenAI SDK.
+    """Call the chat completions endpoint via the OpenAI SDK → Alibaba.
 
-    Returns a dict in a stable shape that the rest of the codebase already understands
-    (it mirrors the previous httpx response: `{"choices": [...], "usage": {...}}`).
+    Returns a dict in a stable shape that the rest of the codebase already
+    understands (it mirrors the previous httpx response):
+        {"choices": [{"message": {"role": "assistant", "content": "..."}}],
+         "usage": {"prompt_tokens": ..., "completion_tokens": ...}}
     """
     client = get_client()
     chosen_model = model or _default_model()
     kwargs: Dict[str, Any] = {
         "model": chosen_model,
-        "messages": _to_messages(messages),
+        "messages": messages,
         "temperature": temperature,
         "max_tokens": max_tokens,
         "timeout": timeout,
@@ -101,7 +94,6 @@ def chat(
         logger.warning("llm_call_failed model=%s err=%s", chosen_model, str(e)[:200])
         raise LLMUnavailable(f"LLM call failed: {e}") from e
 
-    # Normalise to the legacy dict shape used elsewhere in the codebase.
     choice = resp.choices[0] if resp.choices else None
     content = choice.message.content if choice and choice.message else ""
     return {
@@ -137,7 +129,7 @@ async def chat_json(
     max_tokens: int = 600,
     timeout: float = 30.0,
 ) -> Dict[str, Any]:
-    """Call the LLM and parse JSON from the response (handles non-strict providers)."""
+    """Call the LLM and parse JSON from the response."""
     data = await _run_chat_async(
         messages, model=model, temperature=temperature,
         max_tokens=max_tokens, response_format_json=True, timeout=timeout,
@@ -153,11 +145,7 @@ async def _run_chat_async(
     messages: List[Dict[str, str]],
     **kwargs: Any,
 ) -> Dict[str, Any]:
-    """Async wrapper around the sync OpenAI client.
-
-    The OpenAI SDK has both sync and async clients; the sync one is enough for our
-    throughput. We run it in the default executor to avoid blocking the event loop.
-    """
+    """Run the sync OpenAI client in the default executor to avoid blocking."""
     import asyncio
 
     loop = asyncio.get_running_loop()
@@ -179,7 +167,7 @@ def _extract_json_fallback(text: str) -> Dict[str, Any]:
 
 
 def build_langchain_chat_openai():
-    """Build a `langchain_openai.ChatOpenAI` instance using the same provider.
+    """Build a `langchain_openai.ChatOpenAI` instance against the same provider.
 
     Returns None if no LLM is configured (so callers can skip LangChain paths).
     """
@@ -190,7 +178,7 @@ def build_langchain_chat_openai():
     return ChatOpenAI(
         model=settings.llm_model(),
         api_key=settings.llm_api_key(),
-        base_url=settings.llm_base_url() or None,
+        base_url=settings.llm_base_url(),
         temperature=0.2,
         timeout=30,
     )

@@ -6,6 +6,8 @@ StateGraph in `app.agents.graph`. This module:
 
 * runs the input guardrail + PII redaction before invoking the graph
 * invokes the compiled graph with the user's `thread_id`
+* attaches the **Langfuse CallbackHandler** so every node, LLM call and tool
+  call is auto-traced in Langfuse
 * translates the final `SupportState` back into the dict shape that the
   `/chat` endpoint and existing tests already understand
 
@@ -16,13 +18,13 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from app.agents.graph import get_orchestrator_graph
 from app.agents.state import empty_state
 from app.config import settings
-from app.core.observability import trace_request
+from app.core.observability import get_langfuse_callback, trace_request
 from app.guardrails.input_guardrail import run_input_guardrail
 
 logger = logging.getLogger(__name__)
@@ -42,8 +44,6 @@ async def run_orchestrator(
     """
     started = time.time()
     thread_id = thread_id or f"thread-{uuid4().hex}"
-    final_thread_id = thread_id
-    final_checkpoint_id: Optional[str] = None
 
     with trace_request(request_id, message) as tracer:
         tracer.set_metadata("customer_id", customer_id)
@@ -76,9 +76,21 @@ async def run_orchestrator(
         state["pii_redacted"] = bool(input_gr.get("pii_redacted", False))
         state["guardrail"] = {"input": "passed", "output": "passed", "reason": None}
 
-        # --- 3. Run the graph ---
+        # --- 3. Run the graph (with Langfuse callback) ---
         graph = get_orchestrator_graph()
-        config = {"configurable": {"thread_id": thread_id}}
+        callbacks: List[Any] = []
+        lf_handler = get_langfuse_callback()
+        if lf_handler is not None:
+            callbacks.append(lf_handler)
+        config: Dict[str, Any] = {
+            "configurable": {
+                "thread_id": thread_id,
+                "request_id": request_id,
+                "customer_id": customer_id,
+            },
+        }
+        if callbacks:
+            config["callbacks"] = callbacks
         try:
             result_state = await graph.ainvoke(state, config=config)
         except Exception as e:
