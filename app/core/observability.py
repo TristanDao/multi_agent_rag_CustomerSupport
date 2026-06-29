@@ -16,7 +16,7 @@ import time
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional
 
-from app.config import settings
+from app.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -38,35 +38,36 @@ def get_langfuse_client():
     observability outages to be visible).
     """
     global _langfuse_client, _langfuse_initialised
+    s = get_settings()
     if _langfuse_client is not None or _langfuse_initialised:
         return _langfuse_client
     with _lf_lock:
         if _langfuse_client is not None or _langfuse_initialised:
             return _langfuse_client
-        if not settings.LANGFUSE_ENABLED:
+        if not s.LANGFUSE_ENABLED:
             logger.info("langfuse_disabled")
             _langfuse_initialised = True
             return None
-        if not (settings.LANGFUSE_PUBLIC_KEY and settings.LANGFUSE_SECRET_KEY):
+        if not (s.LANGFUSE_PUBLIC_KEY and s.LANGFUSE_SECRET_KEY):
             msg = "LANGFUSE_ENABLED=true but LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY are empty"
             logger.error(msg)
             raise RuntimeError(msg)
         try:
-            os.environ.setdefault("LANGFUSE_PUBLIC_KEY", settings.LANGFUSE_PUBLIC_KEY)
-            os.environ.setdefault("LANGFUSE_SECRET_KEY", settings.LANGFUSE_SECRET_KEY)
-            os.environ.setdefault("LANGFUSE_HOST", settings.LANGFUSE_HOST)
+            os.environ.setdefault("LANGFUSE_PUBLIC_KEY", s.LANGFUSE_PUBLIC_KEY)
+            os.environ.setdefault("LANGFUSE_SECRET_KEY", s.LANGFUSE_SECRET_KEY)
+            os.environ.setdefault("LANGFUSE_HOST", s.LANGFUSE_HOST)
             from langfuse import Langfuse  # type: ignore
 
             _langfuse_client = Langfuse(
-                public_key=settings.LANGFUSE_PUBLIC_KEY,
-                secret_key=settings.LANGFUSE_SECRET_KEY,
-                host=settings.LANGFUSE_HOST,
+                public_key=s.LANGFUSE_PUBLIC_KEY,
+                secret_key=s.LANGFUSE_SECRET_KEY,
+                host=s.LANGFUSE_HOST,
             )
-            logger.info("langfuse_ready host=%s", settings.LANGFUSE_HOST)
+            logger.info("langfuse_ready host=%s", s.LANGFUSE_HOST)
             _langfuse_initialised = True
             return _langfuse_client
         except Exception as e:
-            if settings.LANGFUSE_ENABLED:
+            if s.LANGFUSE_ENABLED:
                 logger.exception("langfuse_init_failed err=%s", str(e))
                 raise
             logger.warning("langfuse_init_failed_disabled err=%s", str(e))
@@ -81,9 +82,10 @@ def get_langfuse_callback():
     Langfuse. It is created lazily and reused across requests.
     """
     global _callback_handler
+    s = get_settings()
     if _callback_handler is not None:
         return _callback_handler
-    if not settings.LANGFUSE_ENABLED:
+    if not s.LANGFUSE_ENABLED:
         return None
     try:
         from langfuse.langchain import CallbackHandler  # type: ignore

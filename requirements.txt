@@ -21,7 +21,6 @@ langchain-text-splitters==0.3.0
 
 # Vector DB and embeddings
 qdrant-client==1.10.1
-sentence-transformers==3.2.0
 numpy==1.26.4
 
 # Hybrid retrieval: BM25 (sparse leg) + rerank helpers

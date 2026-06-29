@@ -26,14 +26,13 @@ class Settings(BaseSettings):
     ALIBABA_RERANK_URL: str = "https://dashscope-intl.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank"
 
     # --- Embedding (RAG) ---------------------------------------------------
-    # Primary: Alibaba text-embedding-v3 via OpenAI-compatible /embeddings.
-    # Fallback: sentence-transformers if EMBEDDING_PROVIDER=sentence_transformers
-    #   or if the Alibaba call fails.
-    EMBEDDING_PROVIDER: str = "alibaba"           # "alibaba" | "sentence_transformers"
+    # Alibaba is the sole embedding provider. text-embedding-v3 via the
+    # OpenAI-compatible /v1/embeddings endpoint. If the call fails the
+    # retriever falls back to a deterministic hash-based vector (offline
+    # dev only) — there is no second model provider.
+    EMBEDDING_PROVIDER: str = "alibaba"
     EMBEDDING_MODEL: str = "text-embedding-v3"
     EMBEDDING_DIM: int = 1024
-    EMBEDDING_FALLBACK_MODEL: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-    EMBEDDING_FALLBACK_DIM: int = 384
 
     # --- Rerank (RAG) ------------------------------------------------------
     # Primary: Alibaba gte-rerank (separate REST endpoint).

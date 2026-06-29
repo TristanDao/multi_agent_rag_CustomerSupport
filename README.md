@@ -13,12 +13,14 @@ A vanilla LLM chatbot hallucinates prices, fabricates return policies, and ignor
 1. **LangGraph orchestrator** — a `StateGraph` that wires specialized agents as nodes, supports conditional routing, and persists state via a Postgres checkpointer.
 2. **Agent Registry** — every specialized agent is declared in one place (`app/agents/registry.py`) with its key, description, capabilities, intents, tools, and examples. The orchestrator's routing prompt is built from this registry, the graph nodes are wired from it, and `GET /admin/agents` exposes it.
 3. **Specialized agents** (product, order, policy-RAG, sales, refund, response) — each with a narrow responsibility and a small set of safe, structured tools.
-4. **OpenAI SDK as the single LLM access layer** — `openai.OpenAI` is used directly and wrapped by `langchain_openai.ChatOpenAI` for agents. The same SDK transparently supports the OpenAI API or the Alibaba DashScope OpenAI-compatible endpoint via `base_url`.
-5. **Tool-grounded generation** — LLM never executes raw SQL; it calls deterministic tools that return JSON.
-6. **Vector-RAG over policy docs** — answers about return/refund, shipping, warranty, etc. are always backed by retrieved markdown chunks.
-7. **Guardrails** — input/output guardrails, prompt-injection detection, PII redaction, and unsupported-claim checks.
-8. **State persistence** — every `thread_id` is checkpointed so conversations resume, human handoff is continuable, and audit trails are queryable.
-9. **Observability** — every request is traced with a stable `request_id`, structured JSON logs, and optional Langfuse integration.
+4. **Alibaba DashScope as the sole LLM provider** (Qwen chat + `text-embedding-v3` + `gte-rerank`). The **OpenAI Python SDK** is used as the HTTP transport — pointed at the Alibaba OpenAI-compatible endpoint via `base_url`. There is no `OPENAI_API_KEY`; the SDK is reused purely for the wire format.
+5. **Hybrid retrieval with rerank** — BM25 (sparse) + Alibaba `text-embedding-v3` (dense) → weighted merge → Alibaba `gte-rerank` re-order. Metadata filter by `intent_tags`, `source`, `section` narrows candidates before scoring.
+6. **Tool-grounded generation** — LLM never executes raw SQL; it calls deterministic tools that return JSON.
+7. **Vector-RAG over policy docs** — answers about return/refund, shipping, warranty, etc. are always backed by retrieved markdown chunks.
+8. **Guardrails** — input/output guardrails, prompt-injection detection, PII redaction, and unsupported-claim checks.
+9. **State persistence** — every `thread_id` is checkpointed so conversations resume, human handoff is continuable, and audit trails are queryable.
+10. **Langfuse observability (required, Postgres-backed)** — every node, LLM call, tool call, retrieval step is auto-traced via `langfuse.langchain.CallbackHandler`. Traces include prompt, completion, model, tokens, cost, latency, and guardrail scores.
+11. **Streamlit chat UI** for manual agent testing on `http://localhost:8501` — shows answer, intent, agents called, tools called, sources, and links to Langfuse.
 
 ---
 
@@ -62,7 +64,7 @@ multi_agent_rag_CustomerSupport/
 │   │   ├── pii_redaction.py   # Regex-based PII redaction
 │   │   ├── security.py        # Request IDs
 │   │   ├── observability.py   # Langfuse tracer (with in-memory fallback)
-│   │   └── llm.py             # OpenAI SDK (works for OpenAI and Alibaba OpenAI-compatible)
+│   │   └── llm.py             # OpenAI SDK pointed at Alibaba OpenAI-compatible endpoint
 │   ├── db/
 │   │   ├── session.py         # SQLAlchemy engine/session
 │   │   ├── models.py          # Product/Customer/Order/Inventory/PriceTier/Promotion/SupportTicket
@@ -71,9 +73,11 @@ multi_agent_rag_CustomerSupport/
 │   ├── rag/
 │   │   ├── document_loader.py
 │   │   ├── chunking.py        # Markdown-aware section splitter + word chunker
-│   │   ├── embeddings.py      # Sentence-Transformers + hash fallback
-│   │   ├── vector_store.py    # Qdrant + in-memory fallback
-│   │   └── retriever.py       # Top-k retrieval
+│   │   ├── embeddings.py      # Alibaba text-embedding-v3 (with hash fallback for offline dev only)
+│   │   ├── bm25_index.py      # In-memory BM25 index (sparse leg of hybrid retrieval)
+│   │   ├── rerank.py          # Alibaba gte-rerank client (with no-op fallback)
+│   │   ├── vector_store.py    # Qdrant + in-memory fallback (with metadata filter support)
+│   │   └── retriever.py       # Hybrid: BM25 + dense + metadata filter + rerank
 │   ├── agents/                # LangGraph orchestrator + Agent Registry
 │   │   ├── registry.py        # AgentSpec + AGENT_REGISTRY (single source of truth)
 │   │   ├── state.py           # SupportState TypedDict (with reducers)
@@ -113,13 +117,18 @@ multi_agent_rag_CustomerSupport/
 ├── data/
 │   ├── docs/                  # 7 markdown policy/FAQ documents
 │   ├── structured/            # generated CSVs
+│   ├── bm25_index.json         # BM25 index, written by ingest_docs.py
 │   └── eval/test_queries.jsonl # 50+ labeled queries
 ├── scripts/
 │   ├── generate_synthetic_data.py
 │   ├── seed_database.py
-│   ├── ingest_docs.py
+│   ├── ingest_docs.py          # writes dense vectors + BM25 index + payload metadata
 │   ├── generate_agent_graph.py # writes docs/agent_graph.md from the registry
 │   └── run_eval.py
+├── ui/
+│   ├── app.py                  # Streamlit chat UI
+│   ├── Dockerfile
+│   └── requirements.txt
 ├── docs/
 │   └── agent_graph.md          # auto-generated Mermaid + table (regenerate via script)
 ├── tests/
@@ -147,11 +156,14 @@ multi_agent_rag_CustomerSupport/
 - **Backend**: Python 3.11+, FastAPI, Pydantic v2
 - **DB**: PostgreSQL 16, SQLAlchemy 2.0
 - **Vector DB**: Qdrant (in-memory fallback for dev)
-- **Embeddings**: `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (hash fallback for offline)
-- **LLM**: **OpenAI Python SDK** (`openai` package). Works with `OPENAI_API_KEY` directly, or with the Alibaba DashScope OpenAI-compatible endpoint via `OPENAI_BASE_URL` / `ALIBABA_URL`. Inside agents, `langchain_openai.ChatOpenAI` wraps the same SDK.
+- **Embeddings**: **Alibaba `text-embedding-v3`** (1024-dim) via the OpenAI-compatible `/v1/embeddings` endpoint. Hash-based fallback for offline dev only (no second model provider).
+- **Rerank**: **Alibaba `gte-rerank`** (DashScope's separate REST endpoint). Fallback: skip rerank, sort by hybrid score
+- **Hybrid retrieval**: BM25 (in-memory `BM25Index`) + dense vector → weighted merge → rerank → top-K
+- **LLM**: **Alibaba DashScope** as the sole LLM provider (Qwen chat). The **OpenAI Python SDK** is used as the HTTP transport via `base_url=ALIBABA_URL`. Inside agents, `langchain_openai.ChatOpenAI` wraps the same SDK.
 - **Orchestration**: **LangGraph `StateGraph`** as the orchestrator. Each node is a specialized LangChain agent. State is persisted via a **Postgres checkpointer** (in-memory backend for dev/tests).
 - **Agent Registry**: single declarative source of truth (`app/agents/registry.py`) for every specialized agent, exposed via `GET /admin/agents` and `GET /admin/agents/{key}`.
-- **Observability**: Langfuse (optional) + structured JSON logs
+- **Observability**: **Langfuse v3** (required) backed by its own Postgres container (`langfuse-db`). Langfuse's `CallbackHandler` is wired into every `graph.ainvoke(...)` so nodes, LLM calls, tool calls, retrievals, and guardrail results are auto-traced.
+- **Chat UI**: **Streamlit** (`ui/app.py`) on `http://localhost:8501`
 - **Synthetic data**: Faker
 
 ---
@@ -160,22 +172,40 @@ multi_agent_rag_CustomerSupport/
 
 ### Option 1: Docker Compose (recommended)
 
+The compose file brings up **6 services**: `postgres`, `qdrant`, `langfuse-db`, `langfuse`, `backend`, `streamlit`.
+
 ```bash
 # 1. Copy environment
 cp .env.example .env
-# Edit .env: set ALIBABA_API_KEY
+# Edit .env: set ALIBABA_API_KEY, LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY
 
 # 2. Start services
-docker compose up --build
+docker compose up --build -d
 
-# 3. Seed the database (in another terminal)
+# 3. Wait for Langfuse to be healthy, then create an API key in the UI
+#    (or use the default admin user: admin@example.com / admin_password
+#     if you set LANGFUSE_USER_PASSWORD accordingly)
+#    → http://localhost:3000  (Settings → API Keys → Create)
+#    → paste pk-lf-... and sk-lf-... into .env
+#    → docker compose restart backend
+
+# 4. Seed the database
 docker compose exec backend python scripts/seed_database.py
 
-# 4. Ingest policy docs into the vector store
+# 5. Ingest policy docs (dense + BM25 + metadata)
 docker compose exec backend python scripts/ingest_docs.py
 ```
 
-The backend will be available at `http://localhost:8000`.
+Once up, open:
+
+| URL | What |
+|---|---|
+| `http://localhost:8000` | FastAPI + Swagger UI |
+| `http://localhost:8000/admin/agents` | Agent Registry (JSON) |
+| `http://localhost:8000/admin/graph` | LangGraph Mermaid diagram |
+| `http://localhost:3000` | Langfuse UI (LLM traces, costs, guardrail scores) |
+| `http://localhost:6333/dashboard` | Qdrant dashboard |
+| `http://localhost:8501` | Streamlit chat UI for testing the agents |
 
 ### Option 2: Local Python
 
@@ -206,23 +236,35 @@ See `.env.example` for the full list. Key variables:
 
 | Variable | Description | Default |
 |---|---|---|
-| `OPENAI_API_KEY` | OpenAI API key (preferred; leave empty to fall back to Alibaba) | `""` |
-| `OPENAI_BASE_URL` | Optional override (e.g. point to a self-hosted OpenAI-compatible gateway) | `""` |
-| `OPENAI_MODEL` | Model name when using OpenAI | `gpt-4o-mini` |
-| `ALIBABA_API_KEY` | Alibaba DashScope API key (fallback; OpenAI-compatible) | `""` |
-| `ALIBABA_URL` | Alibaba OpenAI-compatible endpoint | `https://...maas.aliyuncs.com/compatible-mode/v1` |
-| `ALIBABA_LLM_MODEL` | Primary model when using Alibaba | `qwen-mt-flash` |
-| `DATABASE_URL` | PostgreSQL DSN | `postgresql+...` |
+| `ALIBABA_API_KEY` | Alibaba DashScope API key (sole LLM + embedding + rerank provider) | `""` |
+| `ALIBABA_URL` | Alibaba OpenAI-compatible chat/embedding endpoint | `https://...maas.aliyuncs.com/compatible-mode/v1` |
+| `ALIBABA_LLM_MODEL` | Chat model | `qwen-mt-flash` |
+| `ALIBABA_RERANK_URL` | DashScope gte-rerank REST endpoint | `https://dashscope-intl.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank` |
+| `EMBEDDING_PROVIDER` | `alibaba` or `sentence_transformers` | `alibaba` |
+| `EMBEDDING_MODEL` | `text-embedding-v3` (alibaba) or HF model name | `text-embedding-v3` |
+| `EMBEDDING_DIM` | Embedding vector dimension | `1024` |
+| `RERANK_PROVIDER` | `alibaba` or `none` | `alibaba` |
+| `RERANK_MODEL` | Rerank model name | `gte-rerank` |
+| `RERANK_TOP_N` | Candidates to rerank | `20` |
+| `HYBRID_SPARSE_WEIGHT` | Weight for BM25 in merge | `0.4` |
+| `HYBRID_DENSE_WEIGHT` | Weight for vector in merge | `0.6` |
+| `HYBRID_TOP_N` | Candidates per leg (BM25 + dense) | `20` |
+| `RERANK_FINAL_K` | Final top-K after rerank | `5` |
+| `DATABASE_URL` | PostgreSQL DSN (app data + LangGraph checkpointer) | `postgresql+...` |
 | `QDRANT_URL` | Qdrant endpoint | `http://qdrant:6333` |
-| `EMBEDDING_MODEL` | Sentence-Transformers model | `paraphrase-multilingual-MiniLM-L12-v2` |
+| `LANGFUSE_ENABLED` | Enable Langfuse tracing (required) | `true` |
+| `LANGFUSE_PUBLIC_KEY` | Langfuse project public key | `pk-lf-...` |
+| `LANGFUSE_SECRET_KEY` | Langfuse project secret key | `sk-lf-...` |
+| `LANGFUSE_HOST` | Langfuse base URL | `http://langfuse:3000` |
 | `ENABLE_INPUT_GUARDRAIL` | Toggle input guardrail | `true` |
 | `ENABLE_OUTPUT_GUARDRAIL` | Toggle output guardrail | `true` |
 | `ENABLE_PII_REDACTION` | Redact PII in logs | `true` |
-| `LANGFUSE_ENABLED` | Enable Langfuse tracing | `false` |
 | `CHECKPOINT_BACKEND` | LangGraph checkpointer: `memory` or `postgres` | `memory` |
 | `CHECKPOINT_TTL_DAYS` | Retention for checkpoint rows | `30` |
 
-If both `OPENAI_API_KEY` and `ALIBABA_API_KEY` are empty, the system uses deterministic-only answer generation (still works for many queries, falls back to templated responses when LLM is needed).
+If `ALIBABA_API_KEY` is empty, the system uses deterministic-only answer generation (still works for many queries, falls back to templated responses when LLM is needed).
+
+If `LANGFUSE_ENABLED=true` and the keys are missing or the Langfuse server is unreachable, **the app fails loudly at startup** — silent observability outages are not acceptable.
 
 ---
 
@@ -367,7 +409,7 @@ DB-backed tests (skipped automatically if PostgreSQL is unreachable):
 
 ## Known Limitations
 
-- Hash-embedding fallback is used when `sentence-transformers` is unavailable; install it for production.
+- Hash-embedding fallback is used only when Alibaba is unreachable. The retrieval quality degrades — restore Alibaba connectivity for production.
 - The Qdrant container is included in `docker-compose.yml`; in-memory fallback is used during local Python runs when Qdrant is unreachable.
 - Langfuse is optional and disabled by default; supply keys via `.env` to enable.
 - The synthetic data generator produces ~500 products / 1,200 customers / 1,500 orders; adjust in `scripts/generate_synthetic_data.py` for larger scale.

@@ -59,8 +59,8 @@ Use the following stack unless there is a better reason to change it:
 
 ### Embedding Model
 
-* **Alibaba `text-embedding-v3`** (1024-dim, OpenAI-compatible API) — primary
-* Fallback: `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (offline dev)
+* **Alibaba `text-embedding-v3`** (1024-dim, OpenAI-compatible API) — sole provider
+* Last-resort fallback only: deterministic hash-based vector (offline dev; quality is poor)
 
 ### Rerank Model
 
@@ -227,7 +227,7 @@ multi_agent_rag_retail/
 │   ├── rag/
 │   │   ├── document_loader.py
 │   │   ├── chunking.py              # markdown chunking with metadata
-│   │   ├── embeddings.py            # Alibaba text-embedding-v3 (with sentence-transformers fallback)
+│   │   ├── embeddings.py            # Alibaba text-embedding-v3 (with hash fallback for offline dev)
 │   │   ├── bm25_index.py            # in-memory BM25 over chunks
 │   │   ├── rerank.py                # Alibaba gte-rerank client (with no-op fallback)
 │   │   ├── vector_store.py          # Qdrant with in-memory fallback
@@ -609,10 +609,10 @@ Implement document ingestion and **hybrid retrieval** (sparse BM25 + dense embed
 
 ### Embedding
 
-* Primary: **Alibaba `text-embedding-v3`** via OpenAI-compatible `/v1/embeddings` endpoint.
+* Primary: **Alibaba `text-embedding-v3`** via OpenAI-compatible `/v1/embeddings` endpoint. This is the **sole** embedding provider.
   * Set `EMBEDDING_PROVIDER=alibaba`, `EMBEDDING_MODEL=text-embedding-v3`, `EMBEDDING_DIM=1024`.
-* Fallback: `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (384-dim) for offline dev.
-* `app/rag/embeddings.py` reads the provider/model/dim from settings.
+* Last-resort fallback only: deterministic hash-based vector (offline dev; quality is poor).
+* `app/rag/embeddings.py` reads the model/dim from settings.
 
 ### Rerank
 
@@ -706,7 +706,7 @@ RERANK_FINAL_K=5
 * Hybrid search outperforms pure dense on the eval set (measured by retrieval relevance metric in Phase 11).
 * The retriever works in both modes:
   * Alibaba live (real `text-embedding-v3` + `gte-rerank`)
-  * Offline fallback (sentence-transformers + no rerank) for dev without API keys
+  * Offline fallback (hash-based vectors + no rerank) for dev without API keys. Quality degrades — always restore Alibaba connectivity for production.
 * Policy RAG Agent and the product_agent's wholesale policy fetch both go through this retriever.
 
 ---
@@ -1961,7 +1961,7 @@ P5:
 16. **Checkpoints must never contain raw PII**. PII redaction runs before state is written; add a unit test that asserts phone/email patterns are absent from any `checkpoint` JSONB row.
 17. **`thread_id` is required** for every `/chat` call. Generate a UUIDv4 server-side if the client does not provide one, and always echo it back in the response.
 18. **Diagram is generated, not hand-edited**. Do not paste a Mermaid block into README manually; run `scripts/generate_agent_graph.py` instead.
-19. **RAG retrieval is hybrid by default** (BM25 sparse + Alibaba `text-embedding-v3` dense, weighted merge, then rerank with Alibaba `gte-rerank`). Metadata filter by `intent_tags`, `source`, `section` is applied before retrieval. The offline fallback (sentence-transformers + no rerank) is for dev only.
+19. **RAG retrieval is hybrid by default** (BM25 sparse + Alibaba `text-embedding-v3` dense, weighted merge, then rerank with Alibaba `gte-rerank`). Metadata filter by `intent_tags`, `source`, `section` is applied before retrieval. The offline fallback (hash-based vectors + no rerank) is for dev only — retrieval quality degrades.
 20. **Langfuse is required** when `LANGFUSE_ENABLED=true`. The app fails loudly at startup if Langfuse is unreachable; observability outages are never silent. The `langfuse.langchain.CallbackHandler` is passed into `graph.ainvoke(...)` so every node, LLM call, and tool call is auto-traced. Costs come from Langfuse's built-in model pricing.
 21. **Streamlit UI is the manual test entry point** — it always talks to the FastAPI backend over HTTP, never to the graph directly. This keeps a single source of truth for the API and makes load testing easy.
 
