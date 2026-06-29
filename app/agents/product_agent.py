@@ -30,6 +30,33 @@ def _resolve_query(entities: Dict[str, Any], message: str) -> Dict[str, Any]:
     }
 
 
+def _fetch_wholesale_policy(message: str) -> List[Dict[str, Any]]:
+    """Retrieve wholesale-policy chunks for the answer.
+
+    Used only when `intent == 'wholesale_pricing'` so the response can cite the
+    minimum order value, distributor rules, etc.
+    """
+    try:
+        from app.rag.retriever import retrieve
+
+        chunks: List[Dict[str, Any]] = []
+        seen: set = set()
+        for q in (message, "wholesale pricing policy"):
+            for hit in retrieve(q):
+                if hit.get("doc_id") in seen:
+                    continue
+                seen.add(hit.get("doc_id"))
+                chunks.append(hit)
+                if len(chunks) >= 4:
+                    break
+            if len(chunks) >= 4:
+                break
+        return chunks
+    except Exception as e:
+        logger.warning("wholesale_policy_retrieve_failed err=%s", str(e))
+        return []
+
+
 def product_agent(
     intent: str,
     entities: Dict[str, Any],
@@ -110,6 +137,12 @@ def product_agent(
                 pricing["product_name"] = p["product_name"]
                 blocks.append(pricing)
             tools_called.append("get_price_for_quantity")
+        # Always pull wholesale policy citations for this intent so the response
+        # can include minimum order value, distributor rules, etc.
+        policy_chunks = _fetch_wholesale_policy(message)
+        if policy_chunks:
+            tools_called.append("retrieve_policy_chunks")
+            blocks.append({"policy": policy_chunks})
 
     if intent == "sales_recommendation" and (ctx["sku"] or ctx["category"]):
         tools_called.append("get_related_products")

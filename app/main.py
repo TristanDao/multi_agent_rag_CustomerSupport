@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from app.agents.graph import get_orchestrator_graph
 from app.api.routes_admin import router as admin_router
 from app.api.routes_chat import router as chat_router
 from app.api.routes_health import router as health_router
@@ -31,13 +32,26 @@ async def lifespan(app: FastAPI):
         logger.info("vector_store_ready count=%s", store.count())
     except Exception as e:
         logger.warning("vector_store_init_failed err=%s", str(e))
+    # Warm up the LangGraph orchestrator (validates the Agent Registry, builds the
+    # StateGraph, wires the checkpointer). Failures here are fatal at startup.
+    try:
+        graph = get_orchestrator_graph()
+        # Inspect the graph object so the warmup is visible in the logs.
+        try:
+            node_count = len(graph.get_graph().nodes)
+        except Exception:
+            node_count = -1
+        logger.info("orchestrator_ready node_count=%s", node_count)
+    except Exception as e:
+        logger.exception("orchestrator_init_failed err=%s", str(e))
+        raise
     yield
     logger.info("shutdown complete")
 
 
 app = FastAPI(
     title="Multi-Agent RAG Retail Assistant",
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
 

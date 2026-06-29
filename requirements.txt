@@ -7,11 +7,15 @@ psycopg2-binary==2.9.9
 alembic==1.13.3
 python-dotenv==1.0.1
 
+# OpenAI SDK (used directly + via langchain-openai)
+openai==1.54.0
+
 # LangChain / LangGraph
 langchain==0.3.0
 langchain-core==0.3.0
 langchain-community==0.3.0
 langgraph==0.2.20
+langgraph-checkpoint-postgres==2.0.0
 langchain-openai==0.2.0
 langchain-text-splitters==0.3.0
 

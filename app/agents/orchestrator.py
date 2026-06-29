@@ -1,41 +1,53 @@
-"""Orchestrator agent: routes intent, runs specialized agents, builds final answer."""
-import asyncio
+"""Orchestrator entrypoint.
+
+The previous build had a hand-rolled `run_orchestrator` that called the agents in a
+sequence. In the new design, the actual orchestration is done by the LangGraph
+StateGraph in `app.agents.graph`. This module:
+
+* runs the input guardrail + PII redaction before invoking the graph
+* invokes the compiled graph with the user's `thread_id`
+* translates the final `SupportState` back into the dict shape that the
+  `/chat` endpoint and existing tests already understand
+
+The signature of `run_orchestrator` is intentionally kept compatible with the
+previous build so existing tests (e.g. `tests/test_api_chat.py`) still work.
+"""
+from __future__ import annotations
+
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
+from uuid import uuid4
 
-from app.agents.intent_classifier import classify_intent
-from app.agents.order_agent import order_agent
-from app.agents.policy_rag_agent import policy_rag_agent
-from app.agents.product_agent import product_agent
-from app.agents.refund_decision_agent import refund_decision_agent
-from app.agents.response_agent import response_agent
-from app.agents.sales_recommendation_agent import sales_recommendation_agent
+from app.agents.graph import get_orchestrator_graph
+from app.agents.state import empty_state
 from app.config import settings
 from app.core.observability import trace_request
 from app.guardrails.input_guardrail import run_input_guardrail
-from app.guardrails.output_guardrail import run_output_guardrail
 
 logger = logging.getLogger(__name__)
-
-
-AGENT_MAP = {
-    "product_agent": product_agent,
-    "order_agent": order_agent,
-    "policy_rag_agent": policy_rag_agent,
-    "sales_recommendation_agent": sales_recommendation_agent,
-    "refund_decision_agent": refund_decision_agent,
-}
 
 
 async def run_orchestrator(
     message: str,
     request_id: str,
     customer_id: Optional[str] = None,
+    thread_id: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """Run the multi-agent pipeline via the LangGraph orchestrator.
+
+    Returns a dict with: `answer`, `intent`, `agents_called`, `tools_called`,
+    `policy_chunks`, `agent_results`, `guardrail`, `request_id`, `latency_ms`,
+    `token_usage`, `requires_human`, `pii_redacted`, `thread_id`, `checkpoint_id`.
+    """
     started = time.time()
+    thread_id = thread_id or f"thread-{uuid4().hex}"
+    final_thread_id = thread_id
+    final_checkpoint_id: Optional[str] = None
+
     with trace_request(request_id, message) as tracer:
         tracer.set_metadata("customer_id", customer_id)
+        tracer.set_metadata("thread_id", thread_id)
 
         # --- 1. Input guardrail ---
         if settings.ENABLE_INPUT_GUARDRAIL:
@@ -44,6 +56,7 @@ async def run_orchestrator(
             if input_gr["blocked"]:
                 return _blocked_response(
                     request_id=request_id,
+                    thread_id=thread_id,
                     safe_response=input_gr["safe_response"],
                     reason=input_gr["reason"],
                     started=started,
@@ -53,108 +66,93 @@ async def run_orchestrator(
             processed_message = message
             input_gr = {"blocked": False, "pii_redacted": False}
 
-        # --- 2. Intent classification ---
+        # --- 2. Build initial state ---
+        state = empty_state(
+            user_message=processed_message,
+            request_id=request_id,
+            thread_id=thread_id,
+            customer_id=customer_id,
+        )
+        state["pii_redacted"] = bool(input_gr.get("pii_redacted", False))
+        state["guardrail"] = {"input": "passed", "output": "passed", "reason": None}
+
+        # --- 3. Run the graph ---
+        graph = get_orchestrator_graph()
+        config = {"configurable": {"thread_id": thread_id}}
         try:
-            decision = await classify_intent(processed_message, customer_id=customer_id)
+            result_state = await graph.ainvoke(state, config=config)
         except Exception as e:
-            logger.warning("intent_classifier_failed err=%s", str(e))
-            decision = {"intent": "unknown", "required_agents": ["response_agent"], "entities": {}, "confidence": 0.0}
-        intent = decision["intent"]
-        entities = decision.get("entities", {}) or {}
-        entities.setdefault("customer_id", customer_id)
-        agents = decision.get("required_agents") or ["response_agent"]
-        tracer.set_metadata("intent", intent)
-        tracer.set_metadata("entities", entities)
-        tracer.set_metadata("confidence", decision.get("confidence", 0.0))
+            logger.exception("graph_invoke_failed err=%s", str(e))
+            return _error_response(
+                request_id=request_id,
+                thread_id=thread_id,
+                started=started,
+                error=str(e),
+            )
 
-        # --- 3. Run specialized agents in order ---
-        agent_results: List[Dict[str, Any]] = []
-        tools_called: List[str] = []
-        policy_chunks: List[Dict[str, Any]] = []
-        requires_human = False
+        # The checkpointer stores the latest checkpoint under this thread_id.
+        try:
+            cp_state = graph.get_state(config)
+            if cp_state and cp_state.config:
+                final_checkpoint_id = (
+                    cp_state.config.get("configurable", {}).get("checkpoint_id")
+                    or cp_state.config.get("configurable", {}).get("thread_ts")
+                )
+        except Exception:
+            final_checkpoint_id = None
 
-        for agent_name in agents:
-            if agent_name == "product_agent":
-                r = product_agent(intent, entities, processed_message)
-                agent_results.append(r)
-                tools_called.extend(r.get("tools_called", []))
-            elif agent_name == "order_agent":
-                r = order_agent(intent, entities, processed_message)
-                agent_results.append(r)
-                tools_called.extend(r.get("tools_called", []))
-            elif agent_name == "policy_rag_agent":
-                r = policy_rag_agent(intent, processed_message)
-                agent_results.append(r)
-                policy_chunks = r["data"] or []
-                tools_called.extend(r.get("tools_called", []))
-            elif agent_name == "sales_recommendation_agent":
-                r = sales_recommendation_agent(intent, entities, processed_message)
-                agent_results.append(r)
-                tools_called.extend(r.get("tools_called", []))
-            elif agent_name == "refund_decision_agent":
-                r = await refund_decision_agent(intent, entities, processed_message)
-                agent_results.append(r)
-                tools_called.extend(r.get("tools_called", []))
-                if r.get("decision", {}).get("requires_human_review"):
-                    requires_human = True
-            # response_agent is always called last and handled below
-            elif agent_name == "response_agent":
-                continue
-            else:
-                logger.warning("unknown_agent name=%s", agent_name)
-
-        if intent == "human_escalation":
+        # --- 4. Translate state → API response ---
+        answer = result_state.get("final_answer") or ""
+        intent = result_state.get("intent", "unknown")
+        agent_results_dict: Dict[str, Any] = result_state.get("agent_results") or {}
+        agent_results_list = list(agent_results_dict.values())
+        tools_called: list = list(result_state.get("tools_called") or [])
+        nodes_visited: list = list(result_state.get("nodes_visited") or [])
+        policy_chunks: list = []
+        for r in agent_results_list:
+            if r.get("agent") == "policy_rag_agent":
+                policy_chunks = r.get("data") or []
+                break
+        requires_human = bool(result_state.get("requires_human", False))
+        # If refund decision says it needs human review, propagate that flag.
+        refund_result = agent_results_dict.get("refund_decision_agent") or {}
+        refund_decision = refund_result.get("decision") or {}
+        if refund_decision.get("requires_human_review"):
             requires_human = True
 
-        # --- 4. Response generation ---
-        resp = await response_agent(
-            intent=intent,
-            user_message=processed_message,
-            agent_results=agent_results,
-            policy_chunks=policy_chunks,
-            extra_context={"requires_human": requires_human, "entities": entities},
-        )
-        answer = resp["answer"]
-        token_usage = resp.get("token_usage", {})
+        guardrail = result_state.get("guardrail") or {"input": "passed", "output": "passed", "reason": None}
+        latency_ms = int(result_state.get("latency_ms") or int((time.time() - started) * 1000))
+        token_usage = result_state.get("token_usage") or {"input_tokens": 0, "output_tokens": 0}
+        pii_redacted = bool(result_state.get("pii_redacted", False))
 
-        # --- 5. Output guardrail ---
-        if settings.ENABLE_OUTPUT_GUARDRAIL:
-            out_gr = run_output_guardrail(answer)
-            if out_gr.get("blocked"):
-                answer = out_gr.get("rewritten_answer") or answer
-        else:
-            out_gr = {"passed": True, "blocked": False}
-
-        latency_ms = int((time.time() - started) * 1000)
-        tracer.set_metadata("agents_called", agents)
+        tracer.set_metadata("intent", intent)
+        tracer.set_metadata("agents_called", nodes_visited)
         tracer.set_metadata("tools_called", tools_called)
         tracer.set_metadata("latency_ms", latency_ms)
-        tracer.set_token_usage(
-            token_usage.get("input_tokens", 0), token_usage.get("output_tokens", 0)
-        )
+        tracer.set_metadata("thread_id", thread_id)
+        tracer.set_token_usage(token_usage.get("input_tokens", 0), token_usage.get("output_tokens", 0))
 
         return {
             "answer": answer,
             "intent": intent,
-            "agents_called": agents,
+            "agents_called": nodes_visited,
             "tools_called": tools_called,
             "policy_chunks": policy_chunks,
-            "agent_results": agent_results,
-            "guardrail": {
-                "input": "passed" if not input_gr.get("blocked") else "blocked",
-                "output": "passed" if out_gr.get("passed") else "blocked",
-                "reason": out_gr.get("reason"),
-            },
+            "agent_results": agent_results_list,
+            "guardrail": guardrail,
             "request_id": request_id,
             "latency_ms": latency_ms,
             "token_usage": token_usage,
             "requires_human": requires_human,
-            "pii_redacted": input_gr.get("pii_redacted", False),
+            "pii_redacted": pii_redacted,
+            "thread_id": thread_id,
+            "checkpoint_id": final_checkpoint_id,
         }
 
 
 def _blocked_response(
     request_id: str,
+    thread_id: str,
     safe_response: str,
     reason: str,
     started: float,
@@ -173,4 +171,30 @@ def _blocked_response(
         "token_usage": {"input_tokens": 0, "output_tokens": 0},
         "requires_human": False,
         "pii_redacted": pii_redacted,
+        "thread_id": thread_id,
+        "checkpoint_id": None,
+    }
+
+
+def _error_response(
+    request_id: str,
+    thread_id: str,
+    started: float,
+    error: str,
+) -> Dict[str, Any]:
+    return {
+        "answer": "Xin lỗi, hệ thống đang gặp sự cố. Vui lòng thử lại sau.",
+        "intent": "error",
+        "agents_called": [],
+        "tools_called": [],
+        "policy_chunks": [],
+        "agent_results": [],
+        "guardrail": {"input": "passed", "output": "passed", "reason": error},
+        "request_id": request_id,
+        "latency_ms": int((time.time() - started) * 1000),
+        "token_usage": {"input_tokens": 0, "output_tokens": 0},
+        "requires_human": False,
+        "pii_redacted": False,
+        "thread_id": thread_id,
+        "checkpoint_id": None,
     }

@@ -38,9 +38,21 @@ Use the following stack unless there is a better reason to change it:
 
 ### LLM / Agent Framework
 
-* OpenAI API 
-* LangGraph preferred for multi-agent workflow
-* LangChain is acceptable if simpler
+* **OpenAI SDK** (Python `openai` package) for direct model calls, embeddings, and utility operations
+* **LangChain** as the agent-building toolkit, specifically:
+  * `langchain-core` for base abstractions (messages, prompts, runnables)
+  * `langchain-openai` for `ChatOpenAI` / `OpenAIEmbeddings` wrappers (uses OpenAI SDK under the hood)
+  * `langchain-community` for vector store / retriever / document loader integrations
+* **LangGraph** is the orchestrator — a `StateGraph` that wires specialized LangChain agents as nodes, manages shared state, and supports conditional routing, cycles, and human-in-the-loop
+* **LangGraph checkpointer** (`langgraph-checkpoint-postgres`) for state persistence, audit trail, and resume of mid-conversation flows
+* **How they work together**:
+  * LangGraph is the orchestrator (the "brain" and the state machine)
+  * Each node in the graph is either a specialized LangChain agent (`create_openai_tools_agent` + `AgentExecutor`) or a direct LLM/tool call
+  * Use LangChain's `ChatOpenAI` wrapper for all LLM calls inside nodes (it internally calls the OpenAI SDK)
+  * Use raw OpenAI SDK directly only for: embeddings, simple non-agent completions, batch operations, custom utility scripts
+  * Define node tools with LangChain's `@tool` decorator
+  * LangGraph compiles the graph once at startup; the FastAPI app invokes `graph.ainvoke(state, config)` per request
+* Do not mix two different LLM providers without explicit reason. OpenAI is the default.
 
 ### Vector Database
 
@@ -73,45 +85,57 @@ User
 FastAPI Backend
  ↓
 Input Guardrail
-- prompt injection detection
-- PII detection/redaction for logs
+ - prompt injection detection
+ - PII detection/redaction for logs
  ↓
-Orchestrator Agent
+LangGraph Orchestrator (StateGraph + Postgres Checkpointer)
  ↓
-Specialized Agents
-├── Product Agent
-│   └── SQL: products, inventory, price_tiers
+Nodes (each is a LangChain agent or direct LLM call)
+├── route_intent
+│   └── classifies user intent using Agent Registry metadata
 │
-├── Order Agent
+├── product_agent
+│   └── SQL: products, inventory, price_tiers, promotions
+│
+├── order_agent
 │   └── SQL: customers, orders, order_items
 │
-├── Policy RAG Agent
+├── policy_rag_agent
 │   └── Vector DB: markdown/PDF policy documents
 │
-├── Sales Recommendation Agent
+├── sales_recommendation_agent
 │   └── SQL + product/category rules
 │
-├── Refund Decision Agent
-│   └── Order data + return/refund policy
+├── refund_decision_agent
+│   └── Order data + return/refund policy (sub-graph)
 │
-└── Response Generation Agent
-    └── Compose final answer
+├── response_agent
+│   └── Compose final user-facing answer
+│
+└── human_escalation
+    └── Handoff to human support (terminal node)
  ↓
 Final Guardrail
-- prevent unsupported claims
-- prevent unsafe financial/business promises
-- ensure policy-grounded response
+ - prevent unsupported claims
+ - prevent unsafe financial/business promises
+ - ensure policy-grounded response
  ↓
 Response to User
  ↓
+State Persistence
+ - LangGraph checkpointer (Postgres)
+ - thread_id-keyed checkpoints
+ - resume mid-conversation
+ - audit trail
+ ↓
 Observability
-- Langfuse trace
-- structured logs
-- latency
-- token usage
-- tool calls
-- guardrail result
-- PII-redacted logs only
+ - Langfuse trace (per node)
+ - structured logs
+ - latency, token usage, tool calls
+ - guardrail result
+ - PII-redacted logs only
+ - Agent Registry exposed at /admin/agents
+ - Graph diagram exposed at /admin/graph
 ```
 
 ---
@@ -164,23 +188,33 @@ multi_agent_rag_retail/
 │   │   ├── vector_store.py
 │   │   └── retriever.py
 │   ├── agents/
-│   │   ├── orchestrator.py
-│   │   ├── product_agent.py
-│   │   ├── order_agent.py
-│   │   ├── policy_rag_agent.py
-│   │   ├── sales_recommendation_agent.py
-│   │   ├── refund_decision_agent.py
-│   │   └── response_agent.py
+│   │   ├── registry.py             # AgentSpec + AGENT_REGISTRY (single source of truth)
+│   │   ├── state.py                # SupportState TypedDict
+│   │   ├── graph.py                # build_orchestrator_graph()
+│   │   ├── checkpointer.py         # Postgres checkpointer factory
+│   │   ├── orchestrator.py         # route_intent node + routing logic
+│   │   ├── nodes/
+│   │   │   ├── __init__.py
+│   │   │   ├── route_intent.py
+│   │   │   ├── product_agent.py
+│   │   │   ├── order_agent.py
+│   │   │   ├── policy_rag_agent.py
+│   │   │   ├── sales_recommendation_agent.py
+│   │   │   ├── refund_decision_agent.py
+│   │   │   ├── response_agent.py
+│   │   │   └── human_escalation.py
+│   │   ├── tools/
+│   │   │   ├── __init__.py
+│   │   │   ├── sql_tools.py
+│   │   │   ├── product_tools.py
+│   │   │   ├── order_tools.py
+│   │   │   └── pricing_tools.py
+│   │   └── prompts/                # versioned prompts (.py or .yaml)
 │   ├── guardrails/
 │   │   ├── input_guardrail.py
 │   │   ├── prompt_injection.py
 │   │   ├── output_guardrail.py
 │   │   └── claim_checker.py
-│   ├── tools/
-│   │   ├── sql_tools.py
-│   │   ├── product_tools.py
-│   │   ├── order_tools.py
-│   │   └── pricing_tools.py
 │   └── evaluation/
 │       ├── test_queries.jsonl
 │       ├── evaluator.py
@@ -208,7 +242,12 @@ multi_agent_rag_retail/
 │   ├── generate_synthetic_data.py
 │   ├── ingest_docs.py
 │   ├── seed_database.py
+│   ├── generate_agent_graph.py     # auto-generate Mermaid diagram from registry + compiled graph
 │   └── run_eval.py
+│
+├── docs/
+│   ├── agent_graph.md             # auto-generated Mermaid block
+│   └── agent_graph.svg            # auto-generated PNG/SVG render
 │
 ├── infra/
 │   ├── docker-compose.yml
@@ -622,19 +661,111 @@ Example:
 
 ### Goal
 
-Implement specialized agents and orchestrator.
+Implement specialized agents and a **LangGraph orchestrator** with LangChain agents inside each node, plus an **Agent Registry** and **state persistence** via Postgres checkpointer.
 
-## 6.1 Orchestrator Agent
+### Architecture (hybrid)
+
+```
+LangGraph StateGraph (orchestrator)
+    └── Node = specialized LangChain agent or direct LLM/tool call
+        ├── route_intent (LLM call using Agent Registry)
+        ├── product_agent        (create_openai_tools_agent)
+        ├── order_agent          (create_openai_tools_agent)
+        ├── policy_rag_agent     (retrieval chain)
+        ├── sales_recommendation_agent (create_openai_tools_agent)
+        ├── refund_decision_agent      (sub-graph or chain with branches)
+        ├── response_agent       (LLM call)
+        └── human_escalation     (terminal node, sets requires_human=True)
+```
+
+### LangChain Implementation Notes (per node)
+
+* Each LangChain agent inside a node uses:
+  * LLM: `ChatOpenAI` from `langchain-openai` (uses OpenAI SDK under the hood)
+  * Tools: defined with `@tool` decorator, one tool per SQL/vector operation
+  * Prompt: `ChatPromptTemplate` with `SystemMessage` + `MessagesPlaceholder("agent_scratchpad")`
+  * Agent: `create_openai_tools_agent(llm, tools, prompt)`
+  * Executor: `AgentExecutor(agent=..., tools=..., return_intermediate_steps=True)` for tracing
+* All nodes share a common state schema `SupportState` (TypedDict) — see Section 6.1
+* Conversation memory lives in the graph state (`messages` list), not in LangChain `Memory` classes — the checkpointer is the source of truth
+* LLM call inside custom non-agent code (ingestion, evaluator, scripts): prefer raw `openai.OpenAI()` client to avoid unnecessary LangChain overhead
+* Version-control prompts in `app/agents/prompts/` as plain Python files or YAML
+
+## 6.1 Orchestrator (LangGraph StateGraph)
+
+The orchestrator is a **LangGraph `StateGraph`** that wires all specialized agents as nodes, manages shared state, and supports conditional routing, cycles, and human-in-the-loop.
 
 Responsibilities:
 
-* Understand user intent.
-* Decide which agent/tool to call.
-* Manage workflow state.
-* Combine results from specialized agents.
-* Send final context to Response Agent.
+* Read user message + Agent Registry metadata
+* Classify intent (`route_intent` node)
+* Route to the right agent(s) via conditional edges
+* Maintain shared `SupportState` across all nodes
+* Hand off to `human_escalation` when the refund/policy decision is uncertain or high-value
+* Compile once at app startup with a Postgres checkpointer (see Section 6.6)
 
-Supported intents:
+### Shared state schema
+
+```python
+# app/agents/state.py
+from typing import Annotated, Any, TypedDict
+from langgraph.graph.message import add_messages
+from langchain_core.messages import BaseMessage
+
+class SupportState(TypedDict):
+    messages: Annotated[list[BaseMessage], add_messages]
+    customer_id: str | None
+    thread_id: str
+    request_id: str
+    intent: str
+    entities: dict[str, Any]
+    agent_results: dict[str, Any]      # từng node ghi kết quả vào key riêng
+    sources: list[dict[str, Any]]      # SQL rows, policy doc chunks, etc.
+    requires_human: bool
+    final_answer: str | None
+```
+
+### Graph construction
+
+```python
+# app/agents/graph.py
+from langgraph.graph import StateGraph, END, START
+from langgraph.checkpoint.postgres import PostgresCheckpoint
+from app.agents.state import SupportState
+from app.agents.nodes import (
+    route_intent, product_agent_node, order_agent_node,
+    policy_rag_agent_node, sales_recommendation_agent_node,
+    refund_decision_agent_node, response_agent_node, human_escalation_node,
+)
+from app.agents.registry import AGENT_REGISTRY
+
+def build_orchestrator_graph(checkpointer: PostgresCheckpoint):
+    builder = StateGraph(SupportState)
+
+    # Nodes
+    builder.add_node("route_intent", route_intent)
+    for key, spec in AGENT_REGISTRY.items():
+        builder.add_node(key, spec.node_fn)
+    builder.add_node("response_agent", response_agent_node)
+    builder.add_node("human_escalation", human_escalation_node)
+
+    # Edges
+    builder.add_edge(START, "route_intent")
+    builder.add_conditional_edges(
+        "route_intent",
+        route_to_agent,                       # returns next node name from intent
+        {key: key for key in AGENT_REGISTRY} | {"response_agent": "response_agent", "human_escalation": "human_escalation"},
+    )
+    # Each agent node → response_agent (or refund branches first)
+    for key in AGENT_REGISTRY:
+        builder.add_edge(key, "response_agent")
+    builder.add_edge("response_agent", END)
+    builder.add_edge("human_escalation", END)
+
+    return builder.compile(checkpointer=checkpointer)
+```
+
+### Supported intents
 
 ```text
 product_search
@@ -652,19 +783,21 @@ general_faq
 unknown
 ```
 
-Expected output:
+### `route_intent` expected output
 
 ```json
 {
   "intent": "wholesale_pricing",
-  "required_agents": ["product_agent", "policy_rag_agent", "response_agent"],
   "entities": {
     "product_name": "giấy A4",
     "quantity": 50,
     "customer_type": "wholesale"
-  }
+  },
+  "next_node": "product_agent"
 }
 ```
+
+The orchestrator LLM receives a system prompt that includes the **Agent Registry description block** (name, description, capabilities, example queries of every registered agent) so it can pick the right node. See Section 6.5 for how the registry is built.
 
 ## 6.2 Product Agent
 
@@ -718,7 +851,159 @@ policy markdown docs
 FAQ docs
 ```
 
-## 6.5 Sales Recommendation Agent
+## 6.5 Agent Registry
+
+### Goal
+
+A single source of truth that declares every specialized agent, its capabilities, I/O schemas, tools, and example queries. Used by the orchestrator for routing, by the admin API for introspection, and by the diagram generator for README.
+
+### AgentSpec schema
+
+```python
+# app/agents/registry.py
+from dataclasses import dataclass, field
+from typing import Callable, Any
+from pydantic import BaseModel
+
+@dataclass
+class AgentSpec:
+    key: str                                    # "product_agent"
+    name: str                                   # "Product Agent"
+    description: str                            # "Tìm sản phẩm, kiểm tra tồn kho, bảng giá sỉ"
+    capabilities: list[str]                     # ["product_search", "inventory_check", "wholesale_pricing"]
+    intents: list[str]                          # routing intents this agent handles
+    input_schema: type[BaseModel]
+    output_schema: type[BaseModel]
+    tools: list[str] = field(default_factory=list)
+    example_queries: list[str] = field(default_factory=list)
+    node_fn: Callable | None = None             # set at build time, references the LangGraph node
+```
+
+### Registration
+
+```python
+AGENT_REGISTRY: dict[str, AgentSpec] = {
+    "product_agent": AgentSpec(
+        key="product_agent",
+        name="Product Agent",
+        description="Tìm kiếm sản phẩm, kiểm tra tồn kho, tra bảng giá sỉ/lẻ theo số lượng.",
+        capabilities=["product_search", "inventory_check", "wholesale_pricing", "product_comparison"],
+        intents=["product_search", "product_comparison", "inventory_check", "wholesale_pricing"],
+        input_schema=ProductAgentInput,
+        output_schema=ProductAgentOutput,
+        tools=["search_products", "check_inventory", "get_price_for_quantity", "get_product_by_sku"],
+        example_queries=[
+            "Tìm giấy A4 giá dưới 400k còn hàng ở HCM",
+            "Mua 50 thùng giấy A4 thì giá sỉ bao nhiêu?",
+        ],
+    ),
+    # ... order_agent, policy_rag_agent, sales_recommendation_agent, refund_decision_agent
+}
+```
+
+### Usage
+
+1. **Orchestrator routing**: `route_intent` builds its system prompt from `AGENT_REGISTRY` (name + description + capabilities + intents + examples)
+2. **Graph wiring**: `build_orchestrator_graph()` iterates `AGENT_REGISTRY` and adds each `node_fn` as a graph node
+3. **Admin API**: `GET /admin/agents`, `GET /admin/agents/{key}` (see Phase 10)
+4. **Diagram generation**: `scripts/generate_agent_graph.py` reads registry + compiles the graph, then calls `compiled_graph.get_graph().draw_mermaid()` and writes to `docs/agent_graph.md` (and/or `.svg` via `draw_mermaid_png()`)
+5. **Validation at startup**: app boot fails fast if any registered agent is missing its `node_fn` or if intents are duplicated
+
+### Acceptance Criteria
+
+* Every specialized agent is declared exactly once in `registry.py`
+* Build fails at startup if an agent is not registered or has duplicate intents
+* `GET /admin/agents` returns the full registry as JSON
+* `GET /admin/graph` returns a Mermaid string for the current compiled graph
+* `python scripts/generate_agent_graph.py` writes `docs/agent_graph.md` and exits 0
+* README includes a section showing the auto-generated graph
+
+---
+
+## 6.6 State Persistence with LangGraph Postgres Checkpointer
+
+### Goal
+
+Persist `SupportState` after every node execution so that:
+* Crashes mid-flow can be resumed
+* Human handoff can be continued by another operator
+* Audit trail is queryable per `thread_id`
+* Multi-turn conversations maintain full context without separate memory layers
+
+### Checkpointer setup
+
+```python
+# app/agents/checkpointer.py
+from langgraph.checkpoint.postgres import PostgresCheckpoint
+from app.config import settings
+
+def build_checkpointer() -> PostgresCheckpoint:
+    return PostgresCheckpoint.from_conn_string(settings.DATABASE_URL)
+
+# Compile graph at app startup
+checkpointer = build_checkpointer()
+graph = build_orchestrator_graph(checkpointer)
+```
+
+### Checkpoints table (created by LangGraph)
+
+```sql
+CREATE TABLE checkpoints (
+    thread_id TEXT NOT NULL,
+    checkpoint_id TEXT NOT NULL,
+    parent_checkpoint_id TEXT,
+    type TEXT,
+    checkpoint JSONB,
+    metadata JSONB,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    PRIMARY KEY (thread_id, checkpoint_id)
+);
+CREATE INDEX idx_checkpoints_thread ON checkpoints(thread_id, created_at DESC);
+```
+
+### Invocation pattern (per request)
+
+```python
+config = {"configurable": {"thread_id": thread_id}}
+result = await graph.ainvoke(initial_state, config=config)
+```
+
+* `thread_id` is required for every `/chat` request — auto-generate a UUIDv4 if the client did not provide one
+* The first turn creates the thread, subsequent turns resume from the latest checkpoint
+* State is read from and written to Postgres after every node
+
+### Resume / human handoff flow
+
+```python
+# After a refund_decision_agent sets requires_human=True and routes to human_escalation
+# An operator can resume the same thread later:
+config = {"configurable": {"thread_id": "thread-abc-123"}}
+graph.update_state(config, {"requires_human": False, "human_decision": "approved_partial_refund"})
+result = await graph.ainvoke(None, config=config)   # resumes from human_escalation → response_agent
+```
+
+### What goes into state vs what does not
+
+In state (persisted):
+
+* `messages`, `intent`, `entities`, `agent_results`, `sources`, `requires_human`, `final_answer`
+
+NOT in state (kept only in memory per request):
+
+* Raw prompt strings, intermediate LLM call payloads, raw retrieved chunks (only `sources` metadata is stored)
+* PII (phone, email, full address) — must be redacted before being added to `messages` or `entities`; see Phase 8
+
+### Acceptance Criteria
+
+* Every `/chat` request writes at least one checkpoint
+* Killing the API mid-flow and restarting, then re-invoking with the same `thread_id`, resumes at the correct node
+* `GET /admin/threads/{thread_id}/history` returns the checkpoint list with timestamps and node names
+* Checkpoints table contains no PII (redaction verified by a unit test)
+* Checkpoint retention policy is configurable (default: keep 30 days)
+
+---
+
+## 6.7 Sales Recommendation Agent
 
 Responsibilities:
 
@@ -736,7 +1021,7 @@ inventory
 category rules
 ```
 
-## 6.6 Refund Decision Agent
+## 6.8 Refund Decision Agent
 
 Responsibilities:
 
@@ -767,7 +1052,7 @@ Output:
 }
 ```
 
-## 6.7 Response Generation Agent
+## 6.9 Response Generation Agent
 
 Responsibilities:
 
@@ -777,11 +1062,16 @@ Responsibilities:
 * Mention uncertainty when needed.
 * Suggest human escalation when required.
 
-### Acceptance Criteria
+### Acceptance Criteria (Phase 6)
 
 * Each specialized agent can be tested independently.
+* Every agent is registered in `registry.py`; build fails otherwise.
 * Orchestrator can route at least 10 common user query types.
-* Multi-step queries work end-to-end.
+* Multi-step queries (e.g., wholesale pricing → policy check → response) work end-to-end.
+* Multi-turn conversation: same `thread_id` resumes state correctly.
+* Human escalation: refund-decision sets `requires_human=True`, node ends; operator can resume.
+* `GET /admin/agents` and `GET /admin/graph` return valid responses.
+* `scripts/generate_agent_graph.py` regenerates the README diagram successfully.
 
 ---
 
@@ -964,11 +1254,15 @@ database latency
 ### Required endpoints
 
 ```text
-GET /health
+GET  /health
 POST /chat
 POST /admin/ingest-docs
 POST /admin/seed-data
-GET /admin/logs/sample
+GET  /admin/logs/sample
+GET  /admin/agents                       # list registered agents (from Agent Registry)
+GET  /admin/agents/{key}                 # detail for one agent
+GET  /admin/graph                        # Mermaid diagram of compiled LangGraph
+GET  /admin/threads/{thread_id}/history  # checkpoints for a conversation
 ```
 
 ### Main chat endpoint
@@ -978,9 +1272,13 @@ Request:
 ```json
 {
   "message": "Tôi muốn mua 50 thùng giấy A4, còn hàng không và giá bao nhiêu?",
-  "customer_id": "C001"
+  "customer_id": "C001",
+  "thread_id": "thread-abc-123"
 }
 ```
+
+* `thread_id` is optional. If omitted, the server generates a UUIDv4 and returns it in the response so the client can resume the conversation next turn.
+* If `thread_id` is provided, the LangGraph checkpointer resumes the existing state.
 
 Response:
 
@@ -988,7 +1286,7 @@ Response:
 {
   "answer": "Hiện tại sản phẩm giấy A4 còn đủ hàng...",
   "intent": "wholesale_pricing",
-  "agents_called": ["product_agent", "policy_rag_agent", "response_agent"],
+  "agents_called": ["route_intent", "product_agent", "policy_rag_agent", "response_agent"],
   "sources": [
     {
       "type": "sql",
@@ -1003,14 +1301,56 @@ Response:
     "input": "passed",
     "output": "passed"
   },
-  "request_id": "req_..."
+  "request_id": "req_...",
+  "thread_id": "thread-abc-123",
+  "checkpoint_id": "ckpt_..."
 }
 ```
 
+### Agent Registry endpoints
+
+`GET /admin/agents` returns:
+
+```json
+{
+  "agents": [
+    {
+      "key": "product_agent",
+      "name": "Product Agent",
+      "description": "Tìm kiếm sản phẩm, kiểm tra tồn kho, tra bảng giá sỉ/lẻ.",
+      "capabilities": ["product_search", "inventory_check", "wholesale_pricing"],
+      "intents": ["product_search", "product_comparison", "inventory_check", "wholesale_pricing"],
+      "tools": ["search_products", "check_inventory", "get_price_for_quantity", "get_product_by_sku"],
+      "example_queries": [
+        "Tìm giấy A4 giá dưới 400k còn hàng ở HCM",
+        "Mua 50 thùng giấy A4 thì giá sỉ bao nhiêu?"
+      ]
+    }
+  ],
+  "total": 5
+}
+```
+
+`GET /admin/agents/{key}` returns the same shape for a single agent, or 404.
+
+`GET /admin/graph` returns:
+
+```json
+{
+  "format": "mermaid",
+  "diagram": "graph TD\n  START --> route_intent\n  route_intent --> product_agent\n  ..."
+}
+```
+
+`GET /admin/threads/{thread_id}/history` returns the list of checkpoints (id, node, created_at, metadata) for the given thread.
+
 ### Acceptance Criteria
 
-* `/chat` works for all target query groups.
-* Response includes intent, agents called, and sources.
+* `/chat` works for all target query groups and returns `thread_id` + `checkpoint_id` in the response.
+* Multi-turn conversation: second call with the same `thread_id` resumes state and includes prior messages.
+* `/admin/agents` and `/admin/agents/{key}` return valid JSON matching the AgentSpec schema.
+* `/admin/graph` returns a valid Mermaid string.
+* `/admin/threads/{thread_id}/history` returns checkpoints in chronological order.
 * Errors are returned safely.
 
 ---
@@ -1166,16 +1506,54 @@ infra/terraform/
 ```text
 Project overview
 Architecture diagram
-Agent workflow
+Agent workflow (with auto-generated Mermaid diagram from Agent Registry)
+Registered agents table (auto-generated from registry)
 Data schema
 RAG document structure
 Setup instructions
 Environment variables
-API examples
+API examples (including /admin/agents and /admin/graph)
 Evaluation results
 Known limitations
 Future improvements
 ```
+
+### "Agent Architecture" section (auto-generated)
+
+This section is generated by `scripts/generate_agent_graph.py` and committed to the repo. It includes:
+
+1. **Mermaid diagram** of the LangGraph orchestrator, generated via `compiled_graph.get_graph().draw_mermaid()`. Embedded as a `mermaid` fenced block so GitHub renders it.
+
+2. **Registered agents table**, generated from `AGENT_REGISTRY`:
+
+   ```markdown
+   | Key | Name | Capabilities | Intents | Tools |
+   | --- | --- | --- | --- | --- |
+   | `product_agent` | Product Agent | product_search, inventory_check, wholesale_pricing | product_search, inventory_check, ... | search_products, check_inventory, ... |
+   | ... | ... | ... | ... | ... |
+   ```
+
+3. **Routing example** showing how a sample query flows through the graph:
+
+   ```text
+   User: "Mua 50 thùng giấy A4 thì giá sỉ bao nhiêu?"
+   → route_intent  (intent: wholesale_pricing, entities: {product: A4, qty: 50})
+   → product_agent (queries products + inventory + price_tiers)
+   → policy_rag_agent (retrieves wholesale_policy.md minimum order value)
+   → response_agent (composes final answer with sources)
+   ```
+
+### How the diagram is generated
+
+```bash
+python scripts/generate_agent_graph.py
+# writes docs/agent_graph.md (Mermaid block) and docs/agent_graph.svg
+# README references docs/agent_graph.svg
+```
+
+The script imports `app.agents.registry`, calls `build_orchestrator_graph()` with a temp in-memory checkpointer, then `graph.get_graph().draw_mermaid()` and optionally `draw_mermaid_png()`.
+
+Regenerate any time the registry or graph wiring changes.
 
 ### Include example queries
 
@@ -1191,7 +1569,9 @@ Future improvements
 ### Acceptance Criteria
 
 * README is clear enough for GitHub portfolio.
-* Includes screenshots or sample API responses.
+* "Agent Architecture" section is auto-generated, not hand-written.
+* Mermaid diagram renders on GitHub.
+* Includes screenshots or sample API responses for `/chat`, `/admin/agents`, `/admin/graph`.
 * Explains why this is multi-agent RAG, not just a normal chatbot.
 
 ---
@@ -1276,6 +1656,14 @@ P4:
 8. Always include request_id in logs and responses.
 9. If policy or data is missing, say that information is not available instead of hallucinating.
 10. If the case is uncertain or high-value, escalate to human support.
+11. LLM access is centralized: all agent LLM calls go through `ChatOpenAI` (LangChain). Raw `openai.OpenAI()` is only used in scripts (ingest, eval, seeding) and embeddings. Do not instantiate ad-hoc LLM clients inside agents.
+12. Pin LangChain, LangGraph, and OpenAI SDK versions in `requirements.txt` to avoid breaking changes across `langchain-*` / `langgraph-*` releases.
+13. **Agent Registry is mandatory**: every specialized agent must be declared in `app/agents/registry.py` with a complete `AgentSpec`. The orchestrator builds its routing prompt and the graph nodes from this registry. Adding a new agent without registering it is a bug.
+14. **Intents are globally unique**: an `intent` string maps to exactly one agent key. If two agents claim the same intent, the app must fail at startup.
+15. **LangGraph nodes are stateless functions** of `SupportState`. They must read from and write to the state dict only — no module-level mutable state, no class-level caches. The checkpointer is the only source of truth for cross-request persistence.
+16. **Checkpoints must never contain raw PII**. PII redaction runs before state is written; add a unit test that asserts phone/email patterns are absent from any `checkpoint` JSONB row.
+17. **`thread_id` is required** for every `/chat` call. Generate a UUIDv4 server-side if the client does not provide one, and always echo it back in the response.
+18. **Diagram is generated, not hand-edited**. Do not paste a Mermaid block into README manually; run `scripts/generate_agent_graph.py` instead.
 
 ---
 

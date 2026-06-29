@@ -10,6 +10,13 @@ class Settings(BaseSettings):
     APP_ENV: str = "development"
     LOG_LEVEL: str = "INFO"
 
+    # OpenAI SDK (preferred). Used directly for some calls and wrapped by langchain-openai for agents.
+    OPENAI_API_KEY: str = ""
+    OPENAI_BASE_URL: str = ""  # leave empty to use OpenAI default
+    OPENAI_MODEL: str = "gpt-4o-mini"
+    OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small"
+
+    # Alibaba DashScope (OpenAI-compatible) — kept as a fallback option.
     ALIBABA_API_KEY: str = ""
     ALIBABA_URL: str = "https://ws-v9y2oinbtzzm4ey9.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
     ALIBABA_LLM_MODEL: str = "qwen-mt-flash"
@@ -43,9 +50,43 @@ class Settings(BaseSettings):
     CHUNK_OVERLAP: int = 100
     TOP_K_RETRIEVAL: int = 4
 
+    # LangGraph checkpointer
+    CHECKPOINT_BACKEND: str = "memory"  # "memory" | "postgres"
+    CHECKPOINT_TTL_DAYS: int = 30
+
+    @property
+    def has_openai_key(self) -> bool:
+        return bool(self.OPENAI_API_KEY)
+
+    @property
+    def has_alibaba_key(self) -> bool:
+        return bool(self.ALIBABA_API_KEY)
+
     @property
     def has_llm_key(self) -> bool:
-        return bool(self.ALIBABA_API_KEY)
+        return self.has_openai_key or self.has_alibaba_key
+
+    def llm_base_url(self) -> str:
+        """Resolve which base URL the LLM client should use."""
+        if self.OPENAI_BASE_URL:
+            return self.OPENAI_BASE_URL
+        if not self.has_openai_key and self.has_alibaba_key:
+            return self.ALIBABA_URL
+        return ""
+
+    def llm_api_key(self) -> str:
+        if self.has_openai_key:
+            return self.OPENAI_API_KEY
+        if self.has_alibaba_key:
+            return self.ALIBABA_API_KEY
+        return ""
+
+    def llm_model(self) -> str:
+        if self.has_openai_key:
+            return self.OPENAI_MODEL
+        if self.has_alibaba_key:
+            return self.ALIBABA_LLM_MODEL
+        return self.OPENAI_MODEL
 
 
 @lru_cache

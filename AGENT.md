@@ -4,11 +4,13 @@
 - Be concise and direct.
 - Explain assumptions clearly.
 - Do not over-engineer the solution.
+- Prefer simple, idiomatic solutions over clever ones.
 
 ## Planning Mode
 - Read the project plan and existing files first.
 - Ask clarifying questions only when missing information blocks implementation.
-- Do not assume tech stack, database, UI design, or features unless specified in the plan.
+- Follow the tech stack and architecture defined in `plan.md`. If the plan does not specify something, ask before assuming.
+- It is fine to suggest a different stack or approach if there is a strong reason, but flag it explicitly and wait for approval.
 - Break work into phases and identify dependencies.
 - Before presenting a final plan, review it for:
   - architecture consistency
@@ -20,15 +22,17 @@
 ## Change / Edit Mode
 - Inspect the current codebase before editing.
 - Follow the existing project structure and style.
+- Match the libraries, patterns, and conventions already in use. Do not introduce a new dependency without a clear reason.
 - Split large changes into independent chunks.
 - Use sub-agents when available and useful; otherwise implement sequentially.
 - After each significant change, summarize:
   - changed files
   - reason for change
   - how to test
+- If a change would be faster with a different tool/framework than what the plan specifies, mention it as a suggestion rather than silently switching.
 
 ## Testing & Quality Checks
-- Always run available project checks after changes.
+- Run available project checks after non-trivial changes. For tiny edits (typo, single-line tweak), skip.
 - Prefer scripts from package.json, pyproject.toml, Makefile, README, or docs.
 - Typical checks:
   - lint
