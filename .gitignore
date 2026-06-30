@@ -87,4 +87,4 @@ docker-compose.override.yml
 *.dump
 *.bak
 pg_data/
-CV.md
+# CV.md
